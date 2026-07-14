@@ -1,6 +1,6 @@
-# Native Roblox model sandboxing service
+# nl-web-service
 
-An authenticated Rust HTTP service that copies Roblox-authored models, prepends a compatibility sandbox bootstrap to every Roblox script, uploads the result to a group, and waits for moderation approval. Creator Store listing and public distribution are intentionally out of scope.
+Sandboxes Roblox Gears by modifying their scripts, and uploads them to the Creator Store.
 
 ## Setup
 

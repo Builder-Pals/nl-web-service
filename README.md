@@ -6,6 +6,8 @@ Sandboxes Roblox Gears by modifying their scripts, and uploads them to the Creat
 
 1. Create a Roblox Open Cloud API key owned by an account able to manage the target group.
 2. Grant the asset read and write permissions required by Roblox's Assets APIs.
+   Creator Store source metadata is public and does not require an additional key
+   permission.
 3. Copy `.env.example` to `.env`, use a cryptographically random service token of at least 32 characters, and fill in the Roblox key and group ID.
 4. Create the SQLite parent directory when using a path such as `sqlite://data/cache.db`.
 5. Export the variables and run `cargo run --release`.

@@ -67,11 +67,10 @@ impl RobloxClient {
 
     pub async fn validate_source(&self, id: u64) -> Result<SourceMetadata, AppError> {
         let response = self
-            .send(|| {
-                self.client
-                    .get(self.url(&format!("/toolbox-service/v2/assets/{id}")))
-                    .header("x-api-key", &self.config.roblox_api_key)
-            })
+            // Creator Store details are public. Attaching an Assets-scoped Open
+            // Cloud key makes Roblox authorize the request against the key and
+            // returns 403 when it has no separate Creator Store permission.
+            .send(|| self.source_metadata_request(id))
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(AppError::NotFound);
@@ -114,6 +113,11 @@ impl RobloxClient {
                 .map(str::to_owned)
                 .unwrap_or_else(|| revision_value.to_string()),
         })
+    }
+
+    fn source_metadata_request(&self, id: u64) -> reqwest::RequestBuilder {
+        self.client
+            .get(self.url(&format!("/toolbox-service/v2/assets/{id}")))
     }
 
     pub async fn download(&self, id: u64) -> Result<Bytes, AppError> {
@@ -289,4 +293,38 @@ fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
 }
 fn find_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     find_value(value, keys).and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn config() -> Config {
+        Config {
+            bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            service_token: "a".repeat(32),
+            roblox_api_key: "upload-only-key".into(),
+            creator_group_id: 1,
+            database_url: "sqlite::memory:".into(),
+            cache_ttl: Duration::from_secs(600),
+            request_timeout: Duration::from_secs(20),
+            polling_window: Duration::from_secs(60),
+            polling_interval: Duration::from_secs(2),
+            retry_count: 3,
+            roblox_base_url: "https://apis.roblox.com".into(),
+        }
+    }
+
+    #[test]
+    fn public_source_metadata_request_does_not_send_open_cloud_key() {
+        let client = RobloxClient::new(config()).unwrap();
+        let request = client.source_metadata_request(123).build().unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://apis.roblox.com/toolbox-service/v2/assets/123"
+        );
+        assert!(!request.headers().contains_key("x-api-key"));
+    }
 }

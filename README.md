@@ -19,6 +19,25 @@ GET /v1/sandbox/{asset_id}
 Authorization: Bearer <SERVICE_API_TOKEN>
 ```
 
+Roblox server scripts can instead authenticate with an experience secret:
+
+```luau
+local HttpService = game:GetService("HttpService")
+
+local response = HttpService:RequestAsync({
+    Url = "https://api.fizzyhex.design/v1/sandbox/123456789",
+    Method = "GET",
+    Headers = {
+        ["x-api-key"] = HttpService:GetSecret("SANDBOX_API_KEY"),
+    },
+})
+```
+
+Create `SANDBOX_API_KEY` in the experience's Secrets Store with the same value as
+`SERVICE_API_TOKEN`. Keep this request in a server Script and enable HTTP requests
+for the experience. The `Authorization: Bearer` scheme remains available for
+non-Roblox clients.
+
 A completed request returns `200` only after Roblox reports moderation approval:
 
 ```json

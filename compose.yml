@@ -18,7 +18,7 @@ services:
     depends_on:
       - app
     environment:
-      DOMAIN: ${DOMAIN}
+      DOMAIN: ${DOMAIN:?DOMAIN must be set}
     ports:
       - "80:80"
       - "443:443"

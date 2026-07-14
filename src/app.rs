@@ -178,12 +178,18 @@ async fn run(
 }
 
 fn authenticate(headers: &HeaderMap, token: &str) -> Result<(), AppError> {
-    let supplied = headers
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
-    if supplied.as_bytes().ct_eq(token.as_bytes()).into() {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let expected = token.as_bytes();
+    let valid = bearer.as_bytes().ct_eq(expected) | api_key.as_bytes().ct_eq(expected);
+    if valid.into() {
         Ok(())
     } else {
         Err(AppError::Unauthorized)
@@ -219,11 +225,29 @@ fn response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn auth_is_strict() {
+    fn accepts_bearer_token() {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer abc".parse().unwrap());
         assert!(authenticate(&headers, "abc").is_ok());
         assert!(authenticate(&headers, "abcd").is_err());
+    }
+
+    #[test]
+    fn accepts_x_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "abc".parse().unwrap());
+        assert!(authenticate(&headers, "abc").is_ok());
+        assert!(authenticate(&headers, "abcd").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_credentials() {
+        assert!(authenticate(&HeaderMap::new(), "abc").is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "abc".parse().unwrap());
+        assert!(authenticate(&headers, "abc").is_err());
     }
 }

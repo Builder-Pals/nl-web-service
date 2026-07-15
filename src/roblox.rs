@@ -118,7 +118,7 @@ impl RobloxClient {
     }
 
     async fn validate_unlisted_game(&self, place_id: u64) -> Result<GameMetadata, AppError> {
-        if place_id >= 1_000_000 {
+        if place_id >= 10_000_000 {
             return Err(AppError::IneligibleGame);
         }
         let response = self

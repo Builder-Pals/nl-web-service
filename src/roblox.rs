@@ -121,9 +121,14 @@ impl RobloxClient {
         if place_id >= 100_000_000 {
             return Err(AppError::IneligibleGame);
         }
-        let response = self
+        let mut response = self
             .send(|| self.unlisted_game_probe_request(place_id))
             .await?;
+        if metadata_unavailable(response.status()) {
+            response = self
+                .send(|| self.authenticated_asset_request(place_id))
+                .await?;
+        }
         unlisted_game_metadata(place_id, response.status(), response.headers())
     }
 
@@ -731,5 +736,16 @@ mod tests {
             "https://assetdelivery.roblox.com/v1/asset/?id=1818"
         );
         assert!(!request.headers().contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn authenticated_delivery_headers_identify_unlisted_places() {
+        let mut headers = HeaderMap::new();
+        headers.insert("roblox-assettypeid", "9".parse().unwrap());
+        headers.insert("roblox-assetversionnumber", "20".parse().unwrap());
+
+        let metadata = unlisted_game_metadata(13_969, StatusCode::OK, &headers).unwrap();
+        assert_eq!(metadata.name, "Unlisted Game 13969");
+        assert_eq!(metadata.revision, "20");
     }
 }

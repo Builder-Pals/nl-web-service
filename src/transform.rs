@@ -228,12 +228,68 @@ fn decode(input: &[u8]) -> Result<WeakDom, AppError> {
     if trimmed.starts_with(b"<?xml")
         || (trimmed.starts_with(b"<roblox") && !trimmed.starts_with(b"<roblox!"))
     {
-        let normalized = strip_legacy_external_elements(trimmed)?;
+        let without_externals = strip_legacy_external_elements(trimmed)?;
+        let normalized = strip_legacy_binary_content(without_externals.as_ref())?;
         rbx_xml::from_reader_default(Cursor::new(normalized.as_ref()))
             .map_err(|e| AppError::InvalidModel(e.to_string()))
     } else {
         rbx_binary::from_reader(Cursor::new(input))
             .map_err(|e| AppError::InvalidModel(e.to_string()))
+    }
+}
+
+fn strip_legacy_binary_content(input: &[u8]) -> Result<Cow<'_, [u8]>, AppError> {
+    const BINARY_OPEN: &[u8] = b"<binary";
+    const BINARY_CLOSE: &[u8] = b"</binary>";
+    const HASH_OPEN: &[u8] = b"<hash";
+    const HASH_CLOSE: &[u8] = b"</hash>";
+    const EMPTY_CONTENT: &[u8] = b"<null></null>";
+
+    let mut output = Vec::with_capacity(input.len());
+    let mut copied_until = 0;
+    loop {
+        let binary = input[copied_until..]
+            .windows(BINARY_OPEN.len())
+            .position(|window| window == BINARY_OPEN)
+            .map(|offset| (offset, BINARY_OPEN, BINARY_CLOSE, "binary"));
+        let hash = input[copied_until..]
+            .windows(HASH_OPEN.len())
+            .position(|window| window == HASH_OPEN)
+            .map(|offset| (offset, HASH_OPEN, HASH_CLOSE, "hash"));
+        let next = match (binary, hash) {
+            (Some(binary), Some(hash)) => Some(if binary.0 < hash.0 { binary } else { hash }),
+            (Some(binary), None) => Some(binary),
+            (None, Some(hash)) => Some(hash),
+            (None, None) => None,
+        };
+        let Some((offset, open, close, kind)) = next else {
+            if copied_until == 0 {
+                return Ok(Cow::Borrowed(input));
+            }
+            output.extend_from_slice(&input[copied_until..]);
+            return Ok(Cow::Owned(output));
+        };
+        let start = copied_until + offset;
+        output.extend_from_slice(&input[copied_until..start]);
+        let Some(open_end_offset) = input[start + open.len()..]
+            .iter()
+            .position(|byte| *byte == b'>')
+        else {
+            return Err(AppError::InvalidModel(format!(
+                "legacy {kind} content opening tag was not closed"
+            )));
+        };
+        let content_start = start + open.len() + open_end_offset + 1;
+        let Some(close_offset) = input[content_start..]
+            .windows(close.len())
+            .position(|window| window == close)
+        else {
+            return Err(AppError::InvalidModel(format!(
+                "legacy {kind} content was not closed"
+            )));
+        };
+        output.extend_from_slice(EMPTY_CONTENT);
+        copied_until = content_start + close_offset + close.len();
     }
 }
 
@@ -475,6 +531,27 @@ mod tests {
         assert!(parsed
             .descendants()
             .any(|instance| instance.name == "Game Package (Legacy)"));
+    }
+
+    #[test]
+    fn packages_xml_with_legacy_embedded_texture_content() {
+        let input = br#"<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" version="4"><Item class="Workspace" referent="RBX1"><Properties><string name="Name">Workspace</string></Properties><Item class="Texture" referent="RBX2"><Properties><string name="Name">Texture</string><Content name="Texture" mimeType="image/jpeg"><binary xmime:contentType="image/jpeg">aGVsbG8=</binary></Content></Properties></Item><Item class="Texture" referent="RBX3"><Properties><string name="Name">Hashed Texture</string><Content name="Texture"><hash>0123456789abcdef</hash></Content></Properties></Item></Item></roblox>"#;
+
+        let decoded = decode(input).unwrap();
+        let texture = decoded
+            .descendants()
+            .find(|instance| instance.class == "Texture")
+            .unwrap();
+        assert_eq!(texture.name, "Texture");
+        assert!(decoded
+            .descendants()
+            .any(|instance| instance.name == "Hashed Texture"));
+
+        let output = package_game(input, "Legacy Texture").unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(output)).unwrap();
+        assert!(parsed
+            .descendants()
+            .any(|instance| instance.name == "Game Package (Legacy Texture)"));
     }
 
     #[test]

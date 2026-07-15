@@ -4,7 +4,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use rand::Rng;
-use reqwest::{header::HeaderMap, multipart, Client, Response, StatusCode};
+use reqwest::{header::HeaderMap, multipart, Client, Response, StatusCode, Url};
 use serde_json::{json, Value};
 use tokio::time::sleep;
 
@@ -181,7 +181,19 @@ impl RobloxClient {
         // Sources have already been restricted to public Roblox-authored
         // assets. This endpoint redirects directly to their model content;
         // Open Cloud's assetId endpoint instead returns a JSON location record.
-        let response = self.send(|| self.public_asset_request(id)).await?;
+        let mut response = self.send(|| self.public_asset_request(id)).await?;
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            let delivery = self.send(|| self.authenticated_asset_request(id)).await?;
+            let value = checked_json(delivery).await?;
+            let location = find_string(&value, &["location"]).ok_or_else(|| {
+                AppError::Upstream("asset delivery response had no location".into())
+            })?;
+            let location = approved_asset_location(&location)?;
+            response = self.send(|| self.client.get(location.clone())).await?;
+        }
         if response.status() == StatusCode::NOT_FOUND {
             return Err(AppError::NotFound);
         }
@@ -216,6 +228,12 @@ impl RobloxClient {
             self.url(&format!("/v1/asset/?id={id}"))
         };
         self.client.get(url)
+    }
+
+    fn authenticated_asset_request(&self, id: u64) -> reqwest::RequestBuilder {
+        self.client
+            .get(self.url(&format!("/asset-delivery-api/v1/assetId/{id}")))
+            .header("x-api-key", &self.config.roblox_api_key)
     }
 
     pub async fn upload(&self, source_id: u64, bytes: Vec<u8>) -> Result<String, AppError> {
@@ -338,6 +356,20 @@ impl RobloxClient {
             "retry exhausted: {attempted:?}"
         )))
     }
+}
+
+fn approved_asset_location(location: &str) -> Result<Url, AppError> {
+    let url = Url::parse(location)
+        .map_err(|_| AppError::Upstream("asset delivery returned an invalid location".into()))?;
+    let host = url.host_str().unwrap_or_default();
+    let approved =
+        host == "roblox.com" || host.ends_with(".roblox.com") || host.ends_with(".rbxcdn.com");
+    if url.scheme() != "https" || !approved {
+        return Err(AppError::Upstream(
+            "asset delivery returned an unapproved location".into(),
+        ));
+    }
+    Ok(url)
 }
 
 fn game_metadata(value: &Value, place_id: u64) -> Result<GameMetadata, AppError> {
@@ -578,6 +610,28 @@ mod tests {
             "https://assetdelivery.roblox.com/v1/asset/?id=18426536"
         );
         assert!(!request.headers().contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn authenticated_asset_request_uses_open_cloud_delivery() {
+        let client = RobloxClient::new(config()).unwrap();
+        let request = client
+            .authenticated_asset_request(23886929)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://apis.roblox.com/asset-delivery-api/v1/assetId/23886929"
+        );
+        assert!(request.headers().contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn asset_delivery_locations_are_restricted_to_roblox_cdn() {
+        assert!(approved_asset_location("https://fts.rbxcdn.com/content").is_ok());
+        assert!(approved_asset_location("http://fts.rbxcdn.com/content").is_err());
+        assert!(approved_asset_location("https://rbxcdn.com.example/content").is_err());
     }
 
     #[test]

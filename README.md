@@ -54,7 +54,7 @@ If the 60-second processing window expires, it returns `202` with `Retry-After: 
 
 The variables shown in `.env.example` are supported. `ROBLOX_BASE_URL` is additionally available for integration testing against a mock server and should not be set in production.
 
-The service accepts binary RBXM input only and enforces Roblox's 20 MB asset upload ceiling. A source is eligible only when Creator Store metadata identifies it as a Model authored by Roblox user ID `1`.
+The service accepts binary RBXM input only and enforces Roblox's 20 MB asset upload ceiling. A source is eligible only when public Creator Store or catalog metadata identifies it as a Model or Gear authored by Roblox user ID `1`.
 
 ## Operational notes
 

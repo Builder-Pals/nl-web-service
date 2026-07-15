@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use crate::error::AppError;
 use rbx_types::Variant;
@@ -6,13 +6,38 @@ use rbx_types::Variant;
 pub const PREFIX: &str = "require(game:WaitForChild(\"native_legacy\"))(getfenv());\n";
 
 pub fn sandbox(input: &[u8]) -> Result<Vec<u8>, AppError> {
-    if input.starts_with(b"<?xml")
-        || (input.starts_with(b"<roblox") && !input.starts_with(b"<roblox!"))
-    {
-        return Err(AppError::InvalidModel("XML models are not accepted".into()));
-    }
-    let mut dom = rbx_binary::from_reader(Cursor::new(input))
-        .map_err(|e| AppError::InvalidModel(e.to_string()))?;
+    let decompressed;
+    let input = if input.starts_with(&[0x1f, 0x8b]) {
+        let mut decoder = flate2::read::GzDecoder::new(input);
+        let mut bytes = Vec::new();
+        decoder
+            .by_ref()
+            .take((20 * 1024 * 1024 + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| AppError::InvalidModel(format!("invalid gzip asset: {e}")))?;
+        if bytes.len() > 20 * 1024 * 1024 {
+            return Err(AppError::TooLarge);
+        }
+        decompressed = bytes;
+        decompressed.as_slice()
+    } else {
+        input
+    };
+    let trimmed = input.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(input);
+    let trimmed = trimmed
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map(|start| &trimmed[start..])
+        .unwrap_or(trimmed);
+    let is_xml = trimmed.starts_with(b"<?xml")
+        || (trimmed.starts_with(b"<roblox") && !trimmed.starts_with(b"<roblox!"));
+    let mut dom = if is_xml {
+        rbx_xml::from_reader_default(Cursor::new(trimmed))
+            .map_err(|e| AppError::InvalidModel(e.to_string()))?
+    } else {
+        rbx_binary::from_reader(Cursor::new(input))
+            .map_err(|e| AppError::InvalidModel(e.to_string()))?
+    };
     let refs: Vec<_> = dom
         .descendants()
         .map(|instance| instance.referent())
@@ -86,10 +111,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_xml() {
-        assert!(matches!(
-            sandbox(b"<roblox />"),
-            Err(AppError::InvalidModel(_))
-        ));
+    fn accepts_xml_and_outputs_binary() {
+        let input = br#"<roblox version="4"><Item class="Script" referent="RBX1"><Properties><string name="Name">Script</string><ProtectedString name="Source">print('xml')</ProtectedString></Properties></Item></roblox>"#;
+        let transformed = sandbox(input).unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(transformed)).unwrap();
+        let script = parsed.descendants().find(|i| i.class == "Script").unwrap();
+        let Variant::String(source) = &script.properties[&"Source".into()] else {
+            panic!("wrong source type")
+        };
+        assert_eq!(source, &format!("{PREFIX}print('xml')"));
+    }
+
+    #[test]
+    fn accepts_gzipped_xml() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let input = br#"<roblox version="4"><Item class="Part" referent="RBX1"><Properties><string name="Name">Part</string></Properties></Item></roblox>"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(input).unwrap();
+
+        let transformed = sandbox(&encoder.finish().unwrap()).unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(transformed)).unwrap();
+        assert!(parsed
+            .descendants()
+            .any(|instance| instance.class == "Part"));
     }
 }

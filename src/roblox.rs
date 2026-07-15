@@ -66,53 +66,19 @@ impl RobloxClient {
     }
 
     pub async fn validate_source(&self, id: u64) -> Result<SourceMetadata, AppError> {
-        let response = self
+        let mut response = self
             // Creator Store details are public. Attaching an Assets-scoped Open
             // Cloud key makes Roblox authorize the request against the key and
             // returns 403 when it has no separate Creator Store permission.
             .send(|| self.source_metadata_request(id))
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
-            return Err(AppError::NotFound);
+            // Catalog assets such as classic Roblox-authored gears are not in
+            // Creator Store search, but do have public Economy metadata.
+            response = self.send(|| self.catalog_metadata_request(id)).await?;
         }
         let value = checked_json(response).await?;
-        let creator =
-            find_value(&value, &["creator", "creatorDetails", "creator_details"]).unwrap_or(&value);
-        let creator_id = find_u64(
-            creator,
-            &["creatorId", "creator_id", "userId", "user_id", "id"],
-        );
-        let creator_type = find_string(creator, &["creatorType", "creator_type", "type"]);
-        let asset_type = find_string(&value, &["assetType", "asset_type", "assetTypeName"]);
-        let is_model = asset_type.as_deref().is_some_and(|s| {
-            s.eq_ignore_ascii_case("model") || s.eq_ignore_ascii_case("ASSET_TYPE_MODEL")
-        }) || find_u64(&value, &["assetTypeId", "asset_type_id"]) == Some(10);
-        let is_user = creator_type
-            .as_deref()
-            .map(|s| s.eq_ignore_ascii_case("user"))
-            .unwrap_or(true);
-        if creator_id != Some(1) || !is_user || !is_model {
-            return Err(AppError::Forbidden);
-        }
-        let revision_value = find_value(
-            &value,
-            &[
-                "revisionId",
-                "revision_id",
-                "updatedUtc",
-                "updateTime",
-                "update_time",
-                "updated",
-            ],
-        )
-        .cloned()
-        .unwrap_or_else(|| Value::String(id.to_string()));
-        Ok(SourceMetadata {
-            revision: revision_value
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| revision_value.to_string()),
-        })
+        source_metadata(&value, id)
     }
 
     fn source_metadata_request(&self, id: u64) -> reqwest::RequestBuilder {
@@ -120,14 +86,25 @@ impl RobloxClient {
             .get(self.url(&format!("/toolbox-service/v2/assets/{id}")))
     }
 
+    fn catalog_metadata_request(&self, id: u64) -> reqwest::RequestBuilder {
+        let url = if self
+            .config
+            .roblox_base_url
+            .starts_with("https://apis.roblox.com")
+        {
+            format!("https://economy.roblox.com/v2/assets/{id}/details")
+        } else {
+            // Keep integration tests on their configured mock server.
+            self.url(&format!("/v2/assets/{id}/details"))
+        };
+        self.client.get(url)
+    }
+
     pub async fn download(&self, id: u64) -> Result<Bytes, AppError> {
-        let response = self
-            .send(|| {
-                self.client
-                    .get(self.url(&format!("/asset-delivery-api/v1/assetId/{id}")))
-                    .header("x-api-key", &self.config.roblox_api_key)
-            })
-            .await?;
+        // Sources have already been restricted to public Roblox-authored
+        // assets. This endpoint redirects directly to their model content;
+        // Open Cloud's assetId endpoint instead returns a JSON location record.
+        let response = self.send(|| self.public_asset_request(id)).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(AppError::NotFound);
         }
@@ -149,6 +126,19 @@ impl RobloxClient {
             data.extend_from_slice(&chunk);
         }
         Ok(data.into())
+    }
+
+    fn public_asset_request(&self, id: u64) -> reqwest::RequestBuilder {
+        let url = if self
+            .config
+            .roblox_base_url
+            .starts_with("https://apis.roblox.com")
+        {
+            format!("https://assetdelivery.roblox.com/v1/asset/?id={id}")
+        } else {
+            self.url(&format!("/v1/asset/?id={id}"))
+        };
+        self.client.get(url)
     }
 
     pub async fn upload(&self, source_id: u64, bytes: Vec<u8>) -> Result<String, AppError> {
@@ -250,13 +240,65 @@ impl RobloxClient {
     }
 }
 
+fn source_metadata(value: &Value, id: u64) -> Result<SourceMetadata, AppError> {
+    let creator =
+        find_value(value, &["creator", "creatorDetails", "creator_details"]).unwrap_or(value);
+    let creator_id = find_u64(
+        creator,
+        &["creatorId", "creator_id", "userId", "user_id", "id"],
+    );
+    let creator_type = find_string(creator, &["creatorType", "creator_type", "type"]);
+    let asset_type = find_string(value, &["assetType", "asset_type", "assetTypeName"]);
+    let is_supported_type = asset_type.as_deref().is_some_and(|s| {
+        s.eq_ignore_ascii_case("model")
+            || s.eq_ignore_ascii_case("ASSET_TYPE_MODEL")
+            || s.eq_ignore_ascii_case("gear")
+            || s.eq_ignore_ascii_case("ASSET_TYPE_GEAR")
+    }) || matches!(
+        find_u64(value, &["assetTypeId", "asset_type_id"]),
+        Some(10 | 19)
+    );
+    let is_user = creator_type
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("user"))
+        .unwrap_or(true);
+    if creator_id != Some(1) || !is_user || !is_supported_type {
+        return Err(AppError::Forbidden);
+    }
+    let revision_value = find_value(
+        value,
+        &[
+            "revisionId",
+            "revision_id",
+            "updatedUtc",
+            "updateTime",
+            "update_time",
+            "updated",
+        ],
+    )
+    .cloned()
+    .unwrap_or_else(|| Value::String(id.to_string()));
+    Ok(SourceMetadata {
+        revision: revision_value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| revision_value.to_string()),
+    })
+}
+
 async fn checked_json(response: Response) -> Result<Value, AppError> {
     let status = response.status();
     if status == StatusCode::NOT_FOUND {
         return Err(AppError::NotFound);
     }
     if !status.is_success() {
-        return Err(upstream_status(status));
+        let detail = response.text().await.map_err(map_reqwest)?;
+        let detail = detail.chars().take(2048).collect::<String>();
+        return Err(if detail.is_empty() {
+            upstream_status(status)
+        } else {
+            AppError::Upstream(format!("HTTP {status}: {detail}"))
+        });
     }
     response.json().await.map_err(map_reqwest)
 }
@@ -278,7 +320,11 @@ fn find_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     match value {
         Value::Object(map) => keys
             .iter()
-            .find_map(|k| map.get(*k))
+            .find_map(|key| {
+                map.iter()
+                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+                    .map(|(_, value)| value)
+            })
             .or_else(|| map.values().find_map(|v| find_value(v, keys))),
         Value::Array(a) => a.iter().find_map(|v| find_value(v, keys)),
         _ => None,
@@ -324,6 +370,43 @@ mod tests {
         assert_eq!(
             request.url().as_str(),
             "https://apis.roblox.com/toolbox-service/v2/assets/123"
+        );
+        assert!(!request.headers().contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn public_catalog_metadata_request_does_not_send_open_cloud_key() {
+        let client = RobloxClient::new(config()).unwrap();
+        let request = client.catalog_metadata_request(18426536).build().unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://economy.roblox.com/v2/assets/18426536/details"
+        );
+        assert!(!request.headers().contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn accepts_pascal_case_roblox_gear_metadata() {
+        let value = json!({
+            "AssetId": 18426536,
+            "AssetTypeId": 19,
+            "Creator": {"Id": 1, "CreatorType": "User"},
+            "Updated": "2016-12-06T01:12:37.19Z"
+        });
+
+        let metadata = source_metadata(&value, 18426536).unwrap();
+        assert_eq!(metadata.revision, "2016-12-06T01:12:37.19Z");
+    }
+
+    #[test]
+    fn public_asset_request_does_not_send_open_cloud_key() {
+        let client = RobloxClient::new(config()).unwrap();
+        let request = client.public_asset_request(18426536).build().unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://assetdelivery.roblox.com/v1/asset/?id=18426536"
         );
         assert!(!request.headers().contains_key("x-api-key"));
     }

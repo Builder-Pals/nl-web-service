@@ -13,6 +13,8 @@ pub enum AppError {
     Unauthorized,
     #[error("asset is not an eligible Roblox-authored model")]
     Forbidden,
+    #[error("game must be an uncopylocked root place created before 2018")]
+    IneligibleGame,
     #[error("asset was not found")]
     NotFound,
     #[error("model exceeds the 20 MB limit")]
@@ -45,6 +47,7 @@ impl IntoResponse for AppError {
             Self::InvalidId => (StatusCode::BAD_REQUEST, "invalid_asset_id"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "ineligible_asset"),
+            Self::IneligibleGame => (StatusCode::FORBIDDEN, "ineligible_game"),
             Self::NotFound => (StatusCode::NOT_FOUND, "asset_not_found"),
             Self::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "asset_too_large"),
             Self::InvalidModel(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_rbxm"),

@@ -1178,6 +1178,8 @@ dependencies = [
  "rand 0.9.5",
  "rbx_binary",
  "rbx_dom_weak",
+ "rbx_reflection 6.1.0",
+ "rbx_reflection_database 2.0.2+roblox-700",
  "rbx_types",
  "rbx_xml",
  "reqwest",

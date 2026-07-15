@@ -1,6 +1,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use rand::Rng;
 use reqwest::{multipart, Client, Response, StatusCode};
@@ -20,6 +21,12 @@ pub struct RobloxClient {
 #[derive(Debug)]
 pub struct SourceMetadata {
     pub revision: String,
+}
+
+#[derive(Debug)]
+pub struct GameMetadata {
+    pub revision: String,
+    pub name: String,
 }
 
 #[derive(Debug)]
@@ -79,6 +86,34 @@ impl RobloxClient {
         }
         let value = checked_json(response).await?;
         source_metadata(&value, id)
+    }
+
+    pub async fn validate_game(&self, place_id: u64) -> Result<GameMetadata, AppError> {
+        let universe =
+            checked_json(self.send(|| self.game_universe_request(place_id)).await?).await?;
+        let universe_id =
+            find_u64(&universe, &["universeId", "universe_id"]).ok_or(AppError::NotFound)?;
+        let details =
+            checked_json(self.send(|| self.game_details_request(universe_id)).await?).await?;
+        game_metadata(&details, place_id)
+    }
+
+    fn game_universe_request(&self, place_id: u64) -> reqwest::RequestBuilder {
+        self.client
+            .get(self.url(&format!("/universes/v1/places/{place_id}/universe")))
+    }
+
+    fn game_details_request(&self, universe_id: u64) -> reqwest::RequestBuilder {
+        let url = if self
+            .config
+            .roblox_base_url
+            .starts_with("https://apis.roblox.com")
+        {
+            format!("https://games.roblox.com/v1/games?universeIds={universe_id}")
+        } else {
+            self.url(&format!("/v1/games?universeIds={universe_id}"))
+        };
+        self.client.get(url)
     }
 
     fn source_metadata_request(&self, id: u64) -> reqwest::RequestBuilder {
@@ -142,7 +177,30 @@ impl RobloxClient {
     }
 
     pub async fn upload(&self, source_id: u64, bytes: Vec<u8>) -> Result<String, AppError> {
-        let request = json!({"assetType":"Model","displayName":format!("Sandboxed Roblox model {source_id}"),"description":format!("Sandboxed compatibility copy of Roblox asset {source_id}."),"creationContext":{"creator":{"groupId":self.config.creator_group_id.to_string()}}});
+        self.upload_model(
+            bytes,
+            format!("Sandboxed Roblox model {source_id}"),
+            format!("Sandboxed compatibility copy of Roblox asset {source_id}."),
+        )
+        .await
+    }
+
+    pub async fn upload_game(&self, place_id: u64, bytes: Vec<u8>) -> Result<String, AppError> {
+        self.upload_model(
+            bytes,
+            format!("Sandboxed Roblox game {place_id}"),
+            format!("Sandboxed compatibility package of Roblox game {place_id}."),
+        )
+        .await
+    }
+
+    async fn upload_model(
+        &self,
+        bytes: Vec<u8>,
+        display_name: String,
+        description: String,
+    ) -> Result<String, AppError> {
+        let request = json!({"assetType":"Model","displayName":display_name,"description":description,"creationContext":{"creator":{"groupId":self.config.creator_group_id.to_string()}}});
         let part = multipart::Part::bytes(bytes)
             .file_name("model.rbxm")
             .mime_str("model/x-rbxm")
@@ -238,6 +296,33 @@ impl RobloxClient {
             "retry exhausted: {attempted:?}"
         )))
     }
+}
+
+fn game_metadata(value: &Value, place_id: u64) -> Result<GameMetadata, AppError> {
+    let game = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .ok_or(AppError::NotFound)?;
+    let root_place_id = find_u64(game, &["rootPlaceId", "root_place_id"]);
+    let copying_allowed = find_value(game, &["copyingAllowed", "copying_allowed"])
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let created = find_string(game, &["created"]).ok_or(AppError::IneligibleGame)?;
+    let created = DateTime::parse_from_rfc3339(&created)
+        .map_err(|_| AppError::IneligibleGame)?
+        .with_timezone(&Utc);
+    let cutoff = DateTime::parse_from_rfc3339("2018-01-01T00:00:00Z")
+        .expect("valid cutoff")
+        .with_timezone(&Utc);
+    if root_place_id != Some(place_id) || !copying_allowed || created >= cutoff {
+        return Err(AppError::IneligibleGame);
+    }
+    let name = find_string(game, &["name"]).unwrap_or_else(|| "Unnamed Game".into());
+    let revision = find_string(game, &["updated"])
+        .or_else(|| find_u64(game, &["id"]).map(|id| id.to_string()))
+        .unwrap_or_else(|| place_id.to_string());
+    Ok(GameMetadata { revision, name })
 }
 
 fn source_metadata(value: &Value, id: u64) -> Result<SourceMetadata, AppError> {
@@ -409,5 +494,44 @@ mod tests {
             "https://assetdelivery.roblox.com/v1/asset/?id=18426536"
         );
         assert!(!request.headers().contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn accepts_uncopylocked_pre_2018_root_place_from_any_creator() {
+        let value = json!({"data":[{
+            "id": 13058,
+            "rootPlaceId": 1818,
+            "name": "Classic: Crossroads",
+            "creator": {"id": 999, "type": "User"},
+            "copyingAllowed": true,
+            "created": "2007-05-01T01:07:04.78Z",
+            "updated": "2024-01-29T22:05:10.417Z"
+        }]});
+        let metadata = game_metadata(&value, 1818).unwrap();
+        assert_eq!(metadata.name, "Classic: Crossroads");
+        assert_eq!(metadata.revision, "2024-01-29T22:05:10.417Z");
+    }
+
+    #[test]
+    fn rejects_copylocked_new_and_non_root_games() {
+        let fixture = |copying_allowed, created: &str, root_place_id| {
+            json!({"data":[{
+                "rootPlaceId": root_place_id,
+                "copyingAllowed": copying_allowed,
+                "created": created
+            }]})
+        };
+        assert!(matches!(
+            game_metadata(&fixture(false, "2007-01-01T00:00:00Z", 1818), 1818),
+            Err(AppError::IneligibleGame)
+        ));
+        assert!(matches!(
+            game_metadata(&fixture(true, "2018-01-01T00:00:00Z", 1818), 1818),
+            Err(AppError::IneligibleGame)
+        ));
+        assert!(matches!(
+            game_metadata(&fixture(true, "2007-01-01T00:00:00Z", 999), 1818),
+            Err(AppError::IneligibleGame)
+        ));
     }
 }

@@ -1,6 +1,7 @@
 # nl-web-service
 
 Sandboxes Roblox Gears by modifying their scripts, and uploads them to the Creator Store.
+It can also package eligible uncopylocked Roblox games for Native Legacy.
 
 ## Setup
 
@@ -18,6 +19,13 @@ TLS is intentionally terminated by a reverse proxy or load balancer. Do not expo
 
 ```text
 GET /v1/sandbox/{asset_id}
+Authorization: Bearer <SERVICE_API_TOKEN>
+```
+
+Uncopylocked root places created before 2018 can be packaged with:
+
+```text
+GET /v1/sandbox_game/{place_id}
 Authorization: Bearer <SERVICE_API_TOKEN>
 ```
 
@@ -46,6 +54,9 @@ A completed request returns `200` only after Roblox reports moderation approval:
 {"source_asset_id":123,"sandboxed_asset_id":456,"status":"approved","cached":false}
 ```
 
+The game endpoint uses the same status fields, with `source_place_id` in place
+of `source_asset_id`.
+
 If the 60-second processing window expires, it returns `202` with `Retry-After: 10`. Call the same URL again to resume polling without duplicating the upload.
 
 `GET /healthz` is unauthenticated and checks SQLite connectivity.
@@ -54,7 +65,11 @@ If the 60-second processing window expires, it returns `202` with `Retry-After: 
 
 The variables shown in `.env.example` are supported. `ROBLOX_BASE_URL` is additionally available for integration testing against a mock server and should not be set in production.
 
-The service accepts binary RBXM input only and enforces Roblox's 20 MB asset upload ceiling. A source is eligible only when public Creator Store or catalog metadata identifies it as a Model or Gear authored by Roblox user ID `1`.
+The service accepts binary or XML Roblox files, including gzip-wrapped public
+delivery responses, and enforces Roblox's 20 MB asset upload ceiling. Model and
+Gear sources must be authored by Roblox user ID `1`. Game sources can have any
+creator, but must be an uncopylocked root place whose experience was created
+before 2018.
 
 ## Operational notes
 

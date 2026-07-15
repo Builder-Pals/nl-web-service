@@ -17,7 +17,7 @@ use crate::{
     config::Config,
     db,
     error::AppError,
-    model::{SandboxResponse, Workflow},
+    model::{GameSandboxResponse, GameWorkflow, SandboxResponse, Workflow},
     roblox::{Moderation, Operation, RobloxClient},
     transform,
 };
@@ -28,6 +28,7 @@ pub struct AppState {
     pool: SqlitePool,
     roblox: RobloxClient,
     locks: Arc<DashMap<u64, Arc<Mutex<()>>>>,
+    game_locks: Arc<DashMap<u64, Arc<Mutex<()>>>>,
 }
 
 impl AppState {
@@ -37,6 +38,7 @@ impl AppState {
             config,
             pool,
             locks: Arc::new(DashMap::new()),
+            game_locks: Arc::new(DashMap::new()),
         })
     }
 }
@@ -45,7 +47,156 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/sandbox/{asset_id}", get(sandbox))
+        .route("/v1/sandbox_game/{place_id}", get(sandbox_game))
         .with_state(state)
+}
+
+async fn sandbox_game(
+    State(state): State<AppState>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    authenticate(&headers, &state.config.service_token)?;
+    let id: u64 = raw_id.parse().map_err(|_| AppError::InvalidId)?;
+    if id == 0 {
+        return Err(AppError::InvalidId);
+    }
+    let lock = state
+        .game_locks
+        .entry(id)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+    let result = run_game(&state, id).await;
+    state
+        .game_locks
+        .remove_if(&id, |_, value| Arc::strong_count(value) <= 2);
+    result
+}
+
+async fn run_game(
+    state: &AppState,
+    id: u64,
+) -> Result<(StatusCode, HeaderMap, Json<GameSandboxResponse>), AppError> {
+    let now = Utc::now().timestamp();
+    if let Some(row) = db::get_game(&state.pool, id).await? {
+        if row.state == "approved"
+            && now - row.validated_at < state.config.cache_ttl.as_secs() as i64
+        {
+            return game_response(&row, true);
+        }
+    }
+
+    let metadata = state.roblox.validate_game(id).await?;
+    let current = db::get_game(&state.pool, id).await?;
+    match current {
+        Some(ref row) if row.source_revision == metadata.revision => {
+            db::touch_game(&state.pool, id, now).await?;
+            if row.state == "approved" {
+                let mut fresh = row.clone();
+                fresh.validated_at = now;
+                return game_response(&fresh, true);
+            }
+            if row.state == "failed" {
+                return Err(AppError::Upstream(
+                    row.failure_message
+                        .clone()
+                        .unwrap_or_else(|| "previous game workflow failed".into()),
+                ));
+            }
+        }
+        _ => db::begin_game(&state.pool, id, &metadata.revision, &metadata.name, now).await?,
+    }
+
+    let deadline = Instant::now() + state.config.polling_window;
+    loop {
+        let row = db::get_game(&state.pool, id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("game workflow disappeared"))?;
+        match row.state.as_str() {
+            "uploading" if row.operation_id.is_none() => {
+                let input = state.roblox.download(id).await?;
+                let name = row.source_name.clone();
+                let output =
+                    tokio::task::spawn_blocking(move || transform::package_game(&input, &name))
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))??;
+                let operation = state.roblox.upload_game(id, output).await?;
+                db::update_game(&state.pool, id, "uploading", None, Some(&operation)).await?;
+            }
+            "uploading" => match state
+                .roblox
+                .operation(row.operation_id.as_deref().unwrap())
+                .await?
+            {
+                Operation::Pending => {}
+                Operation::Complete(asset_id) => {
+                    db::update_game(&state.pool, id, "moderating", Some(asset_id), None).await?
+                }
+                Operation::Failed(message) => {
+                    db::fail_game(&state.pool, id, "upload_rejected", &message).await?;
+                    return Err(AppError::Upstream(message));
+                }
+            },
+            "moderating" => match state
+                .roblox
+                .moderation(row.sandboxed_asset_id.expect("moderating game asset") as u64)
+                .await?
+            {
+                Moderation::Pending => {}
+                Moderation::Approved => {
+                    db::update_game(&state.pool, id, "approved", None, None).await?
+                }
+                Moderation::Rejected(message) => {
+                    db::fail_game(&state.pool, id, "moderation_rejected", &message).await?;
+                    return Err(AppError::Upstream(format!(
+                        "moderation rejected: {message}"
+                    )));
+                }
+            },
+            "approved" => return game_response(&row, false),
+            "failed" => {
+                return Err(AppError::Upstream(
+                    row.failure_message
+                        .unwrap_or_else(|| "game workflow failed".into()),
+                ))
+            }
+            other => return Err(anyhow::anyhow!("unknown game workflow state {other}").into()),
+        }
+        if Instant::now() >= deadline {
+            let row = db::get_game(&state.pool, id)
+                .await?
+                .expect("game workflow exists");
+            return game_response(&row, false);
+        }
+        sleep(state.config.polling_interval).await;
+    }
+}
+
+fn game_response(
+    row: &GameWorkflow,
+    cached: bool,
+) -> Result<(StatusCode, HeaderMap, Json<GameSandboxResponse>), AppError> {
+    let complete = row.state == "approved";
+    let mut headers = HeaderMap::new();
+    if !complete {
+        headers.insert(header::RETRY_AFTER, "10".parse().unwrap());
+    }
+    Ok((
+        if complete {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        headers,
+        Json(GameSandboxResponse {
+            source_place_id: row.source_place_id as u64,
+            sandboxed_asset_id: row.sandboxed_asset_id.map(|id| id as u64),
+            status: row.state.clone(),
+            cached,
+            retry_after_seconds: (!complete).then_some(10),
+        }),
+    ))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {

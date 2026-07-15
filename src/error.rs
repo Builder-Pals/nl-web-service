@@ -13,7 +13,7 @@ pub enum AppError {
     Unauthorized,
     #[error("asset is not an eligible Roblox-authored model")]
     Forbidden,
-    #[error("game must be an uncopylocked root place created before 2018")]
+    #[error("game is not an eligible uncopylocked place")]
     IneligibleGame,
     #[error("asset was not found")]
     NotFound,

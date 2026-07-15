@@ -1,4 +1,7 @@
-use std::io::{Cursor, Read};
+use std::{
+    borrow::Cow,
+    io::{Cursor, Read},
+};
 
 use crate::error::AppError;
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
@@ -225,11 +228,44 @@ fn decode(input: &[u8]) -> Result<WeakDom, AppError> {
     if trimmed.starts_with(b"<?xml")
         || (trimmed.starts_with(b"<roblox") && !trimmed.starts_with(b"<roblox!"))
     {
-        rbx_xml::from_reader_default(Cursor::new(trimmed))
+        let normalized = strip_legacy_external_elements(trimmed)?;
+        rbx_xml::from_reader_default(Cursor::new(normalized.as_ref()))
             .map_err(|e| AppError::InvalidModel(e.to_string()))
     } else {
         rbx_binary::from_reader(Cursor::new(input))
             .map_err(|e| AppError::InvalidModel(e.to_string()))
+    }
+}
+
+fn strip_legacy_external_elements(input: &[u8]) -> Result<Cow<'_, [u8]>, AppError> {
+    const OPEN: &[u8] = b"<External>";
+    const CLOSE: &[u8] = b"</External>";
+    let Some(mut start) = input.windows(OPEN.len()).position(|window| window == OPEN) else {
+        return Ok(Cow::Borrowed(input));
+    };
+
+    let mut output = Vec::with_capacity(input.len());
+    let mut copied_until = 0;
+    loop {
+        output.extend_from_slice(&input[copied_until..start]);
+        let content_start = start + OPEN.len();
+        let Some(close_offset) = input[content_start..]
+            .windows(CLOSE.len())
+            .position(|window| window == CLOSE)
+        else {
+            return Err(AppError::InvalidModel(
+                "legacy External element was not closed".into(),
+            ));
+        };
+        copied_until = content_start + close_offset + CLOSE.len();
+        let Some(next_offset) = input[copied_until..]
+            .windows(OPEN.len())
+            .position(|window| window == OPEN)
+        else {
+            output.extend_from_slice(&input[copied_until..]);
+            return Ok(Cow::Owned(output));
+        };
+        start = copied_until + next_offset;
     }
 }
 
@@ -424,6 +460,21 @@ mod tests {
         assert!(parsed
             .descendants()
             .any(|instance| instance.class == "Part"));
+    }
+
+    #[test]
+    fn packages_xml_with_legacy_external_elements() {
+        let input = br#"<roblox version="4"><External>RBX0</External><Item class="Workspace" referent="RBX1"><Properties><string name="Name">Workspace</string></Properties><External>RBX2</External></Item></roblox>"#;
+
+        let decoded = decode(input).unwrap();
+        assert!(decoded
+            .descendants()
+            .any(|instance| instance.class == "Workspace"));
+        let output = package_game(input, "Legacy").unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(output)).unwrap();
+        assert!(parsed
+            .descendants()
+            .any(|instance| instance.name == "Game Package (Legacy)"));
     }
 
     #[test]

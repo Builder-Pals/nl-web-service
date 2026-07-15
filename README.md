@@ -69,7 +69,8 @@ The service accepts binary or XML Roblox files, including gzip-wrapped public
 delivery responses, and enforces Roblox's 20 MB asset upload ceiling. Model and
 Gear sources must be authored by Roblox user ID `1`. Game sources can have any
 creator, but must be an uncopylocked root place whose experience was created
-before 2018.
+before 2018. When Roblox no longer exposes a game's public metadata, a
+downloadable Place asset with an ID below `1000000` is also eligible.
 
 ## Operational notes
 

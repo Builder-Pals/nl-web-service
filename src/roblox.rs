@@ -4,7 +4,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use rand::Rng;
-use reqwest::{multipart, Client, Response, StatusCode};
+use reqwest::{header::HeaderMap, multipart, Client, Response, StatusCode};
 use serde_json::{json, Value};
 use tokio::time::sleep;
 
@@ -15,6 +15,7 @@ const LIMIT: usize = 20 * 1024 * 1024;
 #[derive(Clone)]
 pub struct RobloxClient {
     client: Client,
+    probe_client: Client,
     config: Config,
 }
 
@@ -65,7 +66,15 @@ impl RobloxClient {
                 }
             }))
             .build()?;
-        Ok(Self { client, config })
+        let probe_client = Client::builder()
+            .timeout(config.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self {
+            client,
+            probe_client,
+            config,
+        })
     }
 
     fn url(&self, path: &str) -> String {
@@ -89,13 +98,46 @@ impl RobloxClient {
     }
 
     pub async fn validate_game(&self, place_id: u64) -> Result<GameMetadata, AppError> {
-        let universe =
-            checked_json(self.send(|| self.game_universe_request(place_id)).await?).await?;
-        let universe_id =
-            find_u64(&universe, &["universeId", "universe_id"]).ok_or(AppError::NotFound)?;
-        let details =
-            checked_json(self.send(|| self.game_details_request(universe_id)).await?).await?;
-        game_metadata(&details, place_id)
+        let universe_response = self.send(|| self.game_universe_request(place_id)).await?;
+        if metadata_unavailable(universe_response.status()) {
+            return self.validate_unlisted_game(place_id).await;
+        }
+        let universe = checked_json(universe_response).await?;
+        let Some(universe_id) = find_u64(&universe, &["universeId", "universe_id"]) else {
+            return self.validate_unlisted_game(place_id).await;
+        };
+        let details_response = self.send(|| self.game_details_request(universe_id)).await?;
+        if metadata_unavailable(details_response.status()) {
+            return self.validate_unlisted_game(place_id).await;
+        }
+        let details = checked_json(details_response).await?;
+        match game_metadata(&details, place_id) {
+            Err(AppError::NotFound) => self.validate_unlisted_game(place_id).await,
+            result => result,
+        }
+    }
+
+    async fn validate_unlisted_game(&self, place_id: u64) -> Result<GameMetadata, AppError> {
+        if place_id >= 1_000_000 {
+            return Err(AppError::IneligibleGame);
+        }
+        let response = self
+            .send(|| self.unlisted_game_probe_request(place_id))
+            .await?;
+        unlisted_game_metadata(place_id, response.status(), response.headers())
+    }
+
+    fn unlisted_game_probe_request(&self, place_id: u64) -> reqwest::RequestBuilder {
+        let url = if self
+            .config
+            .roblox_base_url
+            .starts_with("https://apis.roblox.com")
+        {
+            format!("https://assetdelivery.roblox.com/v1/asset/?id={place_id}")
+        } else {
+            self.url(&format!("/v1/asset/?id={place_id}"))
+        };
+        self.probe_client.get(url)
     }
 
     fn game_universe_request(&self, place_id: u64) -> reqwest::RequestBuilder {
@@ -305,6 +347,12 @@ fn game_metadata(value: &Value, place_id: u64) -> Result<GameMetadata, AppError>
         .and_then(|data| data.first())
         .ok_or(AppError::NotFound)?;
     let root_place_id = find_u64(game, &["rootPlaceId", "root_place_id"]);
+    // Roblox represents some downloadable, unlisted games with a successful
+    // response containing a synthetic zero-valued record. This is unavailable
+    // metadata, not affirmative evidence that the place is copylocked.
+    if find_u64(game, &["id"]) == Some(0) && root_place_id == Some(0) {
+        return Err(AppError::NotFound);
+    }
     let copying_allowed = find_value(game, &["copyingAllowed", "copying_allowed"])
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -323,6 +371,42 @@ fn game_metadata(value: &Value, place_id: u64) -> Result<GameMetadata, AppError>
         .or_else(|| find_u64(game, &["id"]).map(|id| id.to_string()))
         .unwrap_or_else(|| place_id.to_string());
     Ok(GameMetadata { revision, name })
+}
+
+fn metadata_unavailable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    )
+}
+
+fn unlisted_game_metadata(
+    place_id: u64,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<GameMetadata, AppError> {
+    let downloadable = status.is_success()
+        || (status.is_redirection() && headers.contains_key(reqwest::header::LOCATION));
+    let asset_type = headers
+        .get("roblox-assettypeid")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if !downloadable || asset_type != Some(9) {
+        return Err(if status == StatusCode::NOT_FOUND {
+            AppError::NotFound
+        } else {
+            AppError::IneligibleGame
+        });
+    }
+    let revision = headers
+        .get("roblox-assetversionnumber")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| place_id.to_string());
+    Ok(GameMetadata {
+        revision,
+        name: format!("Unlisted Game {place_id}"),
+    })
 }
 
 fn source_metadata(value: &Value, id: u64) -> Result<SourceMetadata, AppError> {
@@ -533,5 +617,65 @@ mod tests {
             game_metadata(&fixture(true, "2007-01-01T00:00:00Z", 999), 1818),
             Err(AppError::IneligibleGame)
         ));
+    }
+
+    #[test]
+    fn accepts_downloadable_unlisted_place_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            "https://cdn.example/game".parse().unwrap(),
+        );
+        headers.insert("roblox-assettypeid", "9".parse().unwrap());
+        headers.insert("roblox-assetversionnumber", "42".parse().unwrap());
+
+        let metadata = unlisted_game_metadata(999_999, StatusCode::FOUND, &headers).unwrap();
+        assert_eq!(metadata.name, "Unlisted Game 999999");
+        assert_eq!(metadata.revision, "42");
+    }
+
+    #[test]
+    fn treats_redacted_game_details_as_unavailable_metadata() {
+        let value = json!({"data":[{
+            "id": 0,
+            "rootPlaceId": 0,
+            "name": "[TITLE UNAVAILABLE]",
+            "copyingAllowed": false,
+            "created": "0001-01-01T05:51:00Z"
+        }]});
+
+        assert!(matches!(
+            game_metadata(&value, 25415),
+            Err(AppError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_place_and_non_downloadable_unlisted_assets() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            "https://cdn.example/asset".parse().unwrap(),
+        );
+        headers.insert("roblox-assettypeid", "10".parse().unwrap());
+        assert!(matches!(
+            unlisted_game_metadata(123, StatusCode::FOUND, &headers),
+            Err(AppError::IneligibleGame)
+        ));
+        assert!(matches!(
+            unlisted_game_metadata(123, StatusCode::FORBIDDEN, &HeaderMap::new()),
+            Err(AppError::IneligibleGame)
+        ));
+    }
+
+    #[test]
+    fn unlisted_game_probe_is_public() {
+        let client = RobloxClient::new(config()).unwrap();
+        let request = client.unlisted_game_probe_request(1818).build().unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://assetdelivery.roblox.com/v1/asset/?id=1818"
+        );
+        assert!(!request.headers().contains_key("x-api-key"));
     }
 }

@@ -57,6 +57,16 @@ A completed request returns `200` only after Roblox reports moderation approval:
 The game endpoint uses the same status fields, with `source_place_id` in place
 of `source_asset_id`.
 
+Known historical place IDs are resolved through
+[`Builder-Pals/native-level-archive`](https://github.com/Builder-Pals/native-level-archive)
+before Roblox. The service caches the versioned place index in SQLite, downloads only relative
+content-addressed paths from the configured archive origin, and verifies the declared size and
+SHA-256 before parsing. Unknown IDs retain the existing live-Roblox behavior.
+
+Game responses additionally include `source_kind` (`archive` or `roblox`). Archive-backed
+responses include `archive_record_id` and `archive_sha256`; these fields are optional for backward
+compatibility.
+
 If the 60-second processing window expires, it returns `202` with `Retry-After: 10`. Call the same URL again to resume polling without duplicating the upload.
 
 `GET /healthz` is unauthenticated and checks SQLite connectivity.
@@ -64,6 +74,12 @@ If the 60-second processing window expires, it returns `202` with `Retry-After: 
 ## Configuration
 
 The variables shown in `.env.example` are supported. `ROBLOX_BASE_URL` is additionally available for integration testing against a mock server and should not be set in production.
+
+`ARCHIVE_INDEX_URL` and `ARCHIVE_BLOB_BASE_URL` select the catalog and fixed download origin.
+`ARCHIVE_REFRESH_SECONDS` defaults to `900`, and `ARCHIVE_MAX_SOURCE_BYTES` defaults to
+`67108864` (64 MiB). The
+archive source limit is separate from Roblox's 20 MiB packaged-upload limit. If refresh fails, the
+last valid SQLite-cached index remains active.
 
 The service accepts binary or XML Roblox files, including gzip-wrapped public
 delivery responses, and enforces Roblox's 20 MB asset upload ceiling. Model and

@@ -27,6 +27,8 @@ pub enum AppError {
     Timeout,
     #[error("Roblox service failure: {0}")]
     Upstream(String),
+    #[error("archive integrity failure: {0}")]
+    ArchiveIntegrity(String),
     #[error("internal service failure")]
     Internal(#[from] anyhow::Error),
 }
@@ -54,6 +56,7 @@ impl IntoResponse for AppError {
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "roblox_rate_limited"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "roblox_timeout"),
             Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "roblox_failure"),
+            Self::ArchiveIntegrity(_) => (StatusCode::BAD_GATEWAY, "archive_integrity"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         let message = if matches!(self, Self::Internal(_)) {

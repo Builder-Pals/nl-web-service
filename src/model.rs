@@ -28,6 +28,11 @@ pub struct GameWorkflow {
     pub source_place_id: i64,
     pub source_revision: String,
     pub source_name: String,
+    pub source_kind: String,
+    pub archive_record_id: Option<String>,
+    pub archive_sha256: Option<String>,
+    pub archive_path: Option<String>,
+    pub archive_size: Option<i64>,
     pub sandboxed_asset_id: Option<i64>,
     pub operation_id: Option<String>,
     pub state: String,
@@ -42,6 +47,11 @@ pub struct GameSandboxResponse {
     pub sandboxed_asset_id: Option<u64>,
     pub status: String,
     pub cached: bool,
+    pub source_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_record_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
 }

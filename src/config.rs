@@ -15,6 +15,10 @@ pub struct Config {
     pub polling_interval: Duration,
     pub retry_count: usize,
     pub roblox_base_url: String,
+    pub archive_index_url: String,
+    pub archive_blob_base_url: String,
+    pub archive_refresh: Duration,
+    pub archive_max_source_bytes: usize,
 }
 
 impl Config {
@@ -46,8 +50,29 @@ impl Config {
                 .unwrap_or_else(|_| "https://apis.roblox.com".into())
                 .trim_end_matches('/')
                 .into(),
+            archive_index_url: env::var("ARCHIVE_INDEX_URL").unwrap_or_else(|_| {
+                "https://raw.githubusercontent.com/Builder-Pals/native-level-archive/main/place-index-v1.json".into()
+            }),
+            archive_blob_base_url: ensure_trailing_slash(
+                &env::var("ARCHIVE_BLOB_BASE_URL").unwrap_or_else(|_| {
+                    "https://raw.githubusercontent.com/Builder-Pals/native-level-archive/main/".into()
+                }),
+            ),
+            archive_refresh: seconds("ARCHIVE_REFRESH_SECONDS", 900)?,
+            archive_max_source_bytes: bytes("ARCHIVE_MAX_SOURCE_BYTES", 64 * 1024 * 1024)?,
         })
     }
+}
+
+fn bytes(name: &str, default: usize) -> Result<usize> {
+    env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse()
+        .with_context(|| format!("invalid {name}"))
+}
+
+fn ensure_trailing_slash(value: &str) -> String {
+    format!("{}/", value.trim_end_matches('/'))
 }
 
 fn seconds(name: &str, default: u64) -> Result<Duration> {

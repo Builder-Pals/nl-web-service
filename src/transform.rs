@@ -7,9 +7,11 @@ use crate::error::AppError;
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 use rbx_reflection::{DataType, PropertyKind, PropertySerialization, Scriptability};
 use rbx_types::{Attributes, Ref, Tags, Variant};
+use tree_sitter::{Node, Parser};
 
-pub const PREFIX: &str = "require(game:WaitForChild(\"native_legacy\"))(getfenv());\n";
-const GAME_PREFIX: &str = "require(game:WaitForChild(\"native_legacy\"))(getfenv());";
+pub const PREFIX: &str = "require(game:WaitForChild(\"native_legacy\"))(getfenv());";
+const GAME_PREFIX: &str = PREFIX;
+const STRING_DECODER: &str = "__STRDEC";
 const LIMIT: usize = 20 * 1024 * 1024;
 const TARGET_SERVICES: &[&str] = &[
     "Workspace",
@@ -64,6 +66,7 @@ pub fn sandbox(input: &[u8]) -> Result<Vec<u8>, AppError> {
         .descendants()
         .map(|instance| instance.referent())
         .collect();
+    let mut parser = luau_parser()?;
     for referent in refs {
         let Some(instance) = dom.get_by_ref_mut(referent) else {
             continue;
@@ -85,9 +88,10 @@ pub fn sandbox(input: &[u8]) -> Result<Vec<u8>, AppError> {
                     )))
                 }
             };
+            let text = transform_script_source(&mut parser, &text, PREFIX)?;
             instance
                 .properties
-                .insert(source_key, Variant::String(format!("{PREFIX}{text}")));
+                .insert(source_key, Variant::String(text));
         }
     }
     let roots: Vec<_> = dom.root().children().to_vec();
@@ -156,6 +160,7 @@ pub fn package_game(input: &[u8], game_name: &str) -> Result<Vec<u8>, AppError> 
         .map(|instance| instance.referent())
         .collect();
     let included_refs: std::collections::HashSet<Ref> = package_refs.iter().copied().collect();
+    let mut parser = luau_parser()?;
     for referent in package_refs {
         let Some(instance) = dom.get_by_ref_mut(referent) else {
             continue;
@@ -188,9 +193,7 @@ pub fn package_game(input: &[u8], game_name: &str) -> Result<Vec<u8>, AppError> 
                     instance.class
                 )));
             };
-            if !source.starts_with(GAME_PREFIX) {
-                source.insert_str(0, GAME_PREFIX);
-            }
+            *source = transform_script_source(&mut parser, source, GAME_PREFIX)?;
         }
     }
 
@@ -201,6 +204,119 @@ pub fn package_game(input: &[u8], game_name: &str) -> Result<Vec<u8>, AppError> 
         return Err(AppError::TooLarge);
     }
     Ok(output)
+}
+
+fn luau_parser() -> Result<Parser, AppError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_luau::LANGUAGE.into())
+        .map_err(|error| AppError::InvalidModel(format!("failed to load Luau parser: {error}")))?;
+    Ok(parser)
+}
+
+fn transform_script_source(
+    parser: &mut Parser,
+    source: &str,
+    prefix: &str,
+) -> Result<String, AppError> {
+    let source = source.strip_prefix(prefix).unwrap_or(source);
+    let source = wrap_string_literals(parser, source)?;
+    Ok(format!("{prefix}{source}"))
+}
+
+fn wrap_string_literals(parser: &mut Parser, source: &str) -> Result<String, AppError> {
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| AppError::InvalidModel("failed to parse Luau source".into()))?;
+    let mut insertions = Vec::new();
+    collect_string_insertions(tree.root_node(), source.as_bytes(), &mut insertions);
+    if insertions.is_empty() {
+        return Ok(source.to_owned());
+    }
+
+    // Closing parentheses must precede prefixes when two insertions share a byte boundary.
+    insertions.sort_unstable_by_key(|insertion| (insertion.offset, insertion.order));
+    let extra_len: usize = insertions
+        .iter()
+        .map(|insertion| insertion.text.len())
+        .sum();
+    let mut output = String::with_capacity(source.len() + extra_len);
+    let mut copied_until = 0;
+    for insertion in insertions {
+        output.push_str(&source[copied_until..insertion.offset]);
+        output.push_str(insertion.text);
+        copied_until = insertion.offset;
+    }
+    output.push_str(&source[copied_until..]);
+    Ok(output)
+}
+
+#[derive(Clone, Copy)]
+struct Insertion {
+    offset: usize,
+    order: u8,
+    text: &'static str,
+}
+
+fn collect_string_insertions(node: Node<'_>, source: &[u8], insertions: &mut Vec<Insertion>) {
+    if node.kind() == "string"
+        && !is_literal_type(node)
+        && !is_direct_decoder_argument(node, source)
+    {
+        if is_shorthand_call_argument(node, source) {
+            insertions.push(Insertion {
+                offset: node.start_byte(),
+                order: 1,
+                text: "(__STRDEC ",
+            });
+            insertions.push(Insertion {
+                offset: node.end_byte(),
+                order: 0,
+                text: ")",
+            });
+        } else {
+            insertions.push(Insertion {
+                offset: node.start_byte(),
+                order: 1,
+                text: "__STRDEC ",
+            });
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_string_insertions(child, source, insertions);
+    }
+}
+
+fn is_literal_type(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "literal_type")
+}
+
+fn is_direct_decoder_argument(node: Node<'_>, source: &[u8]) -> bool {
+    let Some(arguments) = node.parent().filter(|parent| parent.kind() == "arguments") else {
+        return false;
+    };
+    let Some(call) = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "function_call")
+    else {
+        return false;
+    };
+    call.child_by_field_name("name")
+        .and_then(|name| name.utf8_text(source).ok())
+        == Some(STRING_DECODER)
+}
+
+fn is_shorthand_call_argument(node: Node<'_>, source: &[u8]) -> bool {
+    let Some(arguments) = node.parent().filter(|parent| parent.kind() == "arguments") else {
+        return false;
+    };
+    arguments
+        .parent()
+        .is_some_and(|parent| parent.kind() == "function_call")
+        && source.get(arguments.start_byte()) != Some(&b'(')
 }
 
 fn decompress(input: &[u8]) -> Result<Vec<u8>, AppError> {
@@ -452,6 +568,10 @@ mod tests {
     use super::*;
     use rbx_types::Enum;
 
+    fn wrap(source: &str) -> String {
+        wrap_string_literals(&mut luau_parser().unwrap(), source).unwrap()
+    }
+
     fn attribute_text(value: Option<&Variant>) -> Option<String> {
         match value? {
             Variant::String(value) => Some(value.clone()),
@@ -461,6 +581,62 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    #[test]
+    fn wraps_luau_string_literals() {
+        assert_eq!(
+            wrap(r#"local asset_id = "rbxassetid://""#),
+            r#"local asset_id = __STRDEC "rbxassetid://""#
+        );
+        assert_eq!(
+            wrap("local owner_names = { [[Telemon]], 'dave' .. 'bazuka' }"),
+            "local owner_names = { __STRDEC [[Telemon]], __STRDEC 'dave' .. __STRDEC 'bazuka' }"
+        );
+    }
+
+    #[test]
+    fn preserves_comments_string_types_and_existing_decoder_calls() {
+        let source = concat!(
+            "-- keep \'comment text\' untouched\n",
+            "type Kind = \"literal type\"\n",
+            "local value: Kind = __STRDEC \"already wrapped\"\n",
+            "local interpolated = `hello {name .. \"!\"}`\n",
+        );
+        let expected = concat!(
+            "-- keep \'comment text\' untouched\n",
+            "type Kind = \"literal type\"\n",
+            "local value: Kind = __STRDEC \"already wrapped\"\n",
+            "local interpolated = __STRDEC `hello {name .. __STRDEC \"!\"}`\n",
+        );
+        assert_eq!(wrap(source), expected);
+    }
+
+    #[test]
+    fn preserves_shorthand_call_syntax_and_line_numbers() {
+        let source = "print \"first\"\nlocal block = [[second\nthird]]\nreturn 'fourth'\n";
+        let transformed = transform_script_source(&mut luau_parser().unwrap(), source, PREFIX)
+            .expect("source transforms");
+
+        assert_eq!(
+            transformed,
+            concat!(
+                "require(game:WaitForChild(\"native_legacy\"))(getfenv());",
+                "print (__STRDEC \"first\")\n",
+                "local block = __STRDEC [[second\nthird]]\n",
+                "return __STRDEC 'fourth'\n",
+            )
+        );
+        assert_eq!(
+            transformed.bytes().filter(|byte| *byte == b'\n').count(),
+            source.bytes().filter(|byte| *byte == b'\n').count()
+        );
+
+        let tree = luau_parser()
+            .unwrap()
+            .parse(&transformed, None)
+            .expect("transformed source parses");
+        assert!(!tree.root_node().has_error());
     }
 
     #[test]
@@ -499,7 +675,7 @@ mod tests {
         let Variant::String(source) = &script.properties[&"Source".into()] else {
             panic!("wrong source type")
         };
-        assert_eq!(source, &format!("{PREFIX}print('xml')"));
+        assert_eq!(source, &format!("{PREFIX}print(__STRDEC 'xml')"));
     }
 
     #[test]

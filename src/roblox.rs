@@ -565,6 +565,10 @@ mod tests {
             polling_interval: Duration::from_secs(2),
             retry_count: 3,
             roblox_base_url: "https://apis.roblox.com".into(),
+            archive_index_url: "https://example.com/place-index-v1.json".into(),
+            archive_blob_base_url: "https://example.com/".into(),
+            archive_refresh: Duration::from_secs(900),
+            archive_max_source_bytes: 64 * 1024 * 1024,
         }
     }
 

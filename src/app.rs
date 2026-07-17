@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 use tokio::{sync::Mutex, time::sleep};
 
 use crate::{
+    archive::{ArchiveClient, ArchiveVariant},
     config::Config,
     db,
     error::AppError,
@@ -27,14 +28,18 @@ pub struct AppState {
     config: Config,
     pool: SqlitePool,
     roblox: RobloxClient,
+    archive: ArchiveClient,
     locks: Arc<DashMap<u64, Arc<Mutex<()>>>>,
     game_locks: Arc<DashMap<u64, Arc<Mutex<()>>>>,
 }
 
 impl AppState {
-    pub fn new(config: Config, pool: SqlitePool) -> anyhow::Result<Self> {
+    pub async fn new(config: Config, pool: SqlitePool) -> anyhow::Result<Self> {
+        let archive = ArchiveClient::new(&config, pool.clone()).await?;
+        archive.spawn_refresh();
         Ok(Self {
             roblox: RobloxClient::new(config.clone())?,
+            archive,
             config,
             pool,
             locks: Arc::new(DashMap::new()),
@@ -87,10 +92,16 @@ async fn run_game(
         }
     }
 
-    let metadata = state.roblox.validate_game(id).await?;
+    let archive = state.archive.resolve(id).await;
+    let (revision, name) = if let Some(variant) = &archive {
+        (format!("archive:{}", variant.sha256), variant.title.clone())
+    } else {
+        let metadata = state.roblox.validate_game(id).await?;
+        (metadata.revision, metadata.name)
+    };
     let current = db::get_game(&state.pool, id).await?;
     match current {
-        Some(ref row) if row.source_revision == metadata.revision => {
+        Some(ref row) if row.source_revision == revision => {
             db::touch_game(&state.pool, id, now).await?;
             if row.state == "approved" {
                 let mut fresh = row.clone();
@@ -105,7 +116,7 @@ async fn run_game(
                 ));
             }
         }
-        _ => db::begin_game(&state.pool, id, &metadata.revision, &metadata.name, now).await?,
+        _ => db::begin_game(&state.pool, id, &revision, &name, archive.as_ref(), now).await?,
     }
 
     let deadline = Instant::now() + state.config.polling_window;
@@ -115,7 +126,11 @@ async fn run_game(
             .ok_or_else(|| anyhow::anyhow!("game workflow disappeared"))?;
         match row.state.as_str() {
             "uploading" if row.operation_id.is_none() => {
-                let input = state.roblox.download(id).await?;
+                let input = if row.source_kind == "archive" {
+                    state.archive.download(&archive_variant(&row)?).await?
+                } else {
+                    state.roblox.download(id).await?.to_vec()
+                };
                 let name = row.source_name.clone();
                 let output =
                     tokio::task::spawn_blocking(move || transform::package_game(&input, &name))
@@ -194,9 +209,23 @@ fn game_response(
             sandboxed_asset_id: row.sandboxed_asset_id.map(|id| id as u64),
             status: row.state.clone(),
             cached,
+            source_kind: row.source_kind.clone(),
+            archive_record_id: row.archive_record_id.clone(),
+            archive_sha256: row.archive_sha256.clone(),
             retry_after_seconds: (!complete).then_some(10),
         }),
     ))
+}
+
+fn archive_variant(row: &GameWorkflow) -> Result<ArchiveVariant, AppError> {
+    let missing = || AppError::ArchiveIntegrity("archive workflow metadata is incomplete".into());
+    Ok(ArchiveVariant {
+        record_id: row.archive_record_id.clone().ok_or_else(missing)?,
+        title: row.source_name.clone(),
+        sha256: row.archive_sha256.clone().ok_or_else(missing)?,
+        size_bytes: row.archive_size.ok_or_else(missing)? as u64,
+        path: row.archive_path.clone().ok_or_else(missing)?,
+    })
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {

@@ -1,4 +1,5 @@
 mod app;
+mod archive;
 mod config;
 mod db;
 mod error;
@@ -23,7 +24,7 @@ async fn main() -> Result<()> {
         .init();
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
-    let state = app::AppState::new(config.clone(), pool)?;
+    let state = app::AppState::new(config.clone(), pool).await?;
     let listener = TcpListener::bind(config.bind_address).await?;
     info!(address = %config.bind_address, "server listening");
     axum::serve(listener, app::router(state))

@@ -5,6 +5,7 @@ use sqlx::{
 };
 use std::str::FromStr;
 
+use crate::archive::ArchiveVariant;
 use crate::model::{GameWorkflow, Workflow};
 
 pub async fn connect(url: &str) -> Result<SqlitePool> {
@@ -75,10 +76,27 @@ pub async fn begin_game(
     id: u64,
     revision: &str,
     name: &str,
+    archive: Option<&ArchiveVariant>,
     now: i64,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO game_workflows(source_place_id,source_revision,source_name,state,validated_at,attempted_at) VALUES(?,?,?,'uploading',?,?) ON CONFLICT(source_place_id) DO UPDATE SET source_revision=excluded.source_revision,source_name=excluded.source_name,sandboxed_asset_id=NULL,operation_id=NULL,state='uploading',failure_code=NULL,failure_message=NULL,validated_at=excluded.validated_at,attempted_at=excluded.attempted_at,completed_at=NULL")
-        .bind(id as i64).bind(revision).bind(name).bind(now).bind(now).execute(pool).await?;
+    let source_kind = if archive.is_some() {
+        "archive"
+    } else {
+        "roblox"
+    };
+    sqlx::query("INSERT INTO game_workflows(source_place_id,source_revision,source_name,source_kind,archive_record_id,archive_sha256,archive_path,archive_size,state,validated_at,attempted_at) VALUES(?,?,?,?,?,?,?,?,'uploading',?,?) ON CONFLICT(source_place_id) DO UPDATE SET source_revision=excluded.source_revision,source_name=excluded.source_name,source_kind=excluded.source_kind,archive_record_id=excluded.archive_record_id,archive_sha256=excluded.archive_sha256,archive_path=excluded.archive_path,archive_size=excluded.archive_size,sandboxed_asset_id=NULL,operation_id=NULL,state='uploading',failure_code=NULL,failure_message=NULL,validated_at=excluded.validated_at,attempted_at=excluded.attempted_at,completed_at=NULL")
+        .bind(id as i64)
+        .bind(revision)
+        .bind(name)
+        .bind(source_kind)
+        .bind(archive.map(|value| value.record_id.as_str()))
+        .bind(archive.map(|value| value.sha256.as_str()))
+        .bind(archive.map(|value| value.path.as_str()))
+        .bind(archive.map(|value| value.size_bytes as i64))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -117,7 +135,7 @@ mod tests {
     async fn model_and_game_workflows_with_the_same_id_are_independent() {
         let pool = connect("sqlite::memory:?cache=shared").await.unwrap();
         begin(&pool, 1818, "model-revision", 1).await.unwrap();
-        begin_game(&pool, 1818, "game-revision", "Crossroads", 1)
+        begin_game(&pool, 1818, "game-revision", "Crossroads", None, 1)
             .await
             .unwrap();
 
@@ -126,5 +144,38 @@ mod tests {
         assert_eq!(model.source_revision, "model-revision");
         assert_eq!(game.source_revision, "game-revision");
         assert_eq!(game.source_name, "Crossroads");
+        assert_eq!(game.source_kind, "roblox");
+    }
+
+    #[tokio::test]
+    async fn archive_workflow_persists_integrity_metadata() {
+        let pool = connect("sqlite::memory:?cache=shared").await.unwrap();
+        let archive = ArchiveVariant {
+            record_id: "nla_fixture".into(),
+            title: "Archived Crossroads".into(),
+            sha256: "a".repeat(64),
+            size_bytes: 1234,
+            path: "levels/sha256/aa/file.rbxlx".into(),
+        };
+        begin_game(
+            &pool,
+            1818,
+            &format!("archive:{}", archive.sha256),
+            &archive.title,
+            Some(&archive),
+            1,
+        )
+        .await
+        .unwrap();
+
+        let game = get_game(&pool, 1818).await.unwrap().unwrap();
+        assert_eq!(game.source_kind, "archive");
+        assert_eq!(game.archive_record_id.as_deref(), Some("nla_fixture"));
+        assert_eq!(
+            game.archive_sha256.as_deref(),
+            Some(archive.sha256.as_str())
+        );
+        assert_eq!(game.archive_path.as_deref(), Some(archive.path.as_str()));
+        assert_eq!(game.archive_size, Some(1234));
     }
 }

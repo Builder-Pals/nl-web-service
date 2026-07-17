@@ -7,6 +7,7 @@ pub struct Config {
     pub bind_address: SocketAddr,
     pub service_token: String,
     pub roblox_api_key: String,
+    pub release_tag: String,
     pub creator_group_id: u64,
     pub database_url: String,
     pub cache_ttl: Duration,
@@ -34,6 +35,7 @@ impl Config {
                 .context("invalid BIND_ADDRESS")?,
             service_token,
             roblox_api_key: required("ROBLOX_OPEN_CLOUD_API_KEY")?,
+            release_tag: env::var("RELEASE_TAG").unwrap_or_else(|_| "dev".into()),
             creator_group_id: required("ROBLOX_CREATOR_GROUP_ID")?
                 .parse()
                 .context("invalid ROBLOX_CREATOR_GROUP_ID")?,

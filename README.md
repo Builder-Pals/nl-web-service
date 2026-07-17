@@ -2,7 +2,7 @@
 
 This project is responsible for providing web services for Native Legacy.
 
-## `/healthz`
+## `GET /healthz`
 
 Returns 200 OK if the service has successfully started.
 

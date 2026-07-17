@@ -18,7 +18,7 @@ OR
 x-api-key: <SERVICE_API_TOKEN>
 ```
 
-### `GET /v1/sandbox_game/{place_id}`
+### `GET /v1/sandbox_game/{place_id OR nla_id}`
 
 #### Uncopylocked Games
 
@@ -26,7 +26,9 @@ Games that have been left open-source are available through the proxy! Games upl
 
 #### Archived Games
 
-Copies of games that have archived `.rbxl` files available will have the best copies available served.
+Copies of games that have archived `.rbxl` files available will have the 'best' available versions served.
+An exact snapshot can be selected by using its Native Level Archive record ID, for example
+`GET /v1/sandbox_game/nla_9e4f05af76b5c21ba1bca1db7d20868e`.
 
 ### `GET /v1/sandbox/{asset_id}`
 

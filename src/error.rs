@@ -7,6 +7,8 @@ use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("invalid nla id")]
+    InvalidArchiveId,
     #[error("invalid asset id")]
     InvalidId,
     #[error("authentication required")]
@@ -46,6 +48,7 @@ struct ErrorDetail<'a> {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
+            Self::InvalidArchiveId => (StatusCode::BAD_REQUEST, "invalid_archive_id"),
             Self::InvalidId => (StatusCode::BAD_REQUEST, "invalid_asset_id"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "ineligible_asset"),

@@ -101,6 +101,25 @@ impl ArchiveClient {
             .map(|place| place.preferred.clone())
     }
 
+    pub async fn resolve_nla(&self, record_id: &str) -> Option<(u64, ArchiveVariant)> {
+        let state = self.inner.state.read().await;
+        state.index.places.iter().find_map(|(place_id, place)| {
+            place
+                .variants
+                .iter()
+                .find(|variant| variant.record_id == record_id)
+                .cloned()
+                .map(|variant| {
+                    (
+                        place_id
+                            .parse()
+                            .expect("archive place IDs are validated while loading"),
+                        variant,
+                    )
+                })
+        })
+    }
+
     pub async fn download(&self, variant: &ArchiveVariant) -> Result<Vec<u8>, AppError> {
         validate_variant(variant).map_err(AppError::ArchiveIntegrity)?;
         if variant.size_bytes > self.inner.max_source_bytes as u64 {
@@ -344,6 +363,12 @@ mod tests {
                         "sha256": sha256,
                         "size_bytes": payload.len(),
                         "path": "levels/sha256/aa/file.rbxlx"
+                    }, {
+                        "record_id": "nla_9e4f05af76b5c21ba1bca1db7d20868e",
+                        "title": "Exact Fixture",
+                        "sha256": sha256,
+                        "size_bytes": payload.len(),
+                        "path": "levels/sha256/aa/file.rbxlx"
                     }]
                 }
             }
@@ -400,6 +425,17 @@ mod tests {
         let pool = db::connect("sqlite::memory:?cache=shared").await.unwrap();
         let client = ArchiveClient::new(&config, pool.clone()).await.unwrap();
         let variant = client.resolve(123).await.unwrap();
+        let (place_id, nla_variant) = client
+            .resolve_nla("nla_9e4f05af76b5c21ba1bca1db7d20868e")
+            .await
+            .unwrap();
+        assert_eq!(place_id, 123);
+        assert_eq!(
+            nla_variant.record_id,
+            "nla_9e4f05af76b5c21ba1bca1db7d20868e"
+        );
+        assert_ne!(nla_variant.record_id, variant.record_id);
+        assert!(client.resolve_nla("nla_missing").await.is_none());
         assert_eq!(client.download(&variant).await.unwrap(), payload);
 
         let cached = ArchiveClient::new(&config, pool).await.unwrap();

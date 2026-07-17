@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "node-terminal",
+            "request": "launch",
+            "name": "Test native-web-service (with .env)",
+            "command": "cargo test -- --nocapture",
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env"
+        },
+        {
+            "type": "node-terminal",
+            "request": "launch",
+            "name": "Run native-web-service (with .env)",
+            "command": "cargo run",
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env"
+        }
+    ]
+}

@@ -62,17 +62,27 @@ async fn sandbox_game(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     authenticate(&headers, &state.config.service_token)?;
-    let id: u64 = raw_id.parse().map_err(|_| AppError::InvalidId)?;
-    if id == 0 {
-        return Err(AppError::InvalidId);
-    }
+    let (id, requested_archive) = if raw_id.starts_with("nla_") {
+        let (place_id, variant) = state
+            .archive
+            .resolve_nla(&raw_id)
+            .await
+            .ok_or(AppError::InvalidArchiveId)?;
+        (place_id, Some(variant))
+    } else {
+        let place_id: u64 = raw_id.parse().map_err(|_| AppError::InvalidId)?;
+        if place_id == 0 {
+            return Err(AppError::InvalidId);
+        }
+        (place_id, state.archive.resolve(place_id).await)
+    };
     let lock = state
         .game_locks
         .entry(id)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
     let _guard = lock.lock().await;
-    let result = run_game(&state, id).await;
+    let result = run_game(&state, id, requested_archive).await;
     state
         .game_locks
         .remove_if(&id, |_, value| Arc::strong_count(value) <= 2);
@@ -82,17 +92,20 @@ async fn sandbox_game(
 async fn run_game(
     state: &AppState,
     id: u64,
+    archive: Option<ArchiveVariant>,
 ) -> Result<(StatusCode, HeaderMap, Json<GameSandboxResponse>), AppError> {
     let now = Utc::now().timestamp();
     if let Some(row) = db::get_game(&state.pool, id).await? {
         if row.state == "approved"
             && now - row.validated_at < state.config.cache_ttl.as_secs() as i64
+            && archive
+                .as_ref()
+                .is_none_or(|variant| row.source_revision == format!("archive:{}", variant.sha256))
         {
             return game_response(&row, true);
         }
     }
 
-    let archive = state.archive.resolve(id).await;
     let (revision, name) = if let Some(variant) = &archive {
         (format!("archive:{}", variant.sha256), variant.title.clone())
     } else {
@@ -405,6 +418,19 @@ fn response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use sha2::{Digest, Sha256};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tower::ServiceExt;
+
+    const NLA_ID: &str = "nla_9e4f05af76b5c21ba1bca1db7d20868e";
 
     #[test]
     fn accepts_bearer_token() {
@@ -429,5 +455,148 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "abc".parse().unwrap());
         assert!(authenticate(&headers, "abc").is_err());
+    }
+
+    #[tokio::test]
+    async fn sandbox_game_accepts_an_exact_nla_variant() {
+        let payload = b"<roblox version=\"4\"><Item class=\"Workspace\" referent=\"RBX1\"><Properties><string name=\"Name\">Workspace</string></Properties></Item></roblox>".to_vec();
+        let sha256 = Sha256::digest(&payload)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "places": {
+                "192800": {
+                    "universe_id": 47545,
+                    "preferred": {
+                        "record_id": "nla_preferred",
+                        "title": "Preferred Fixture",
+                        "sha256": sha256,
+                        "size_bytes": payload.len(),
+                        "path": "levels/sha256/aa/fixture.rbxlx"
+                    },
+                    "variants": [{
+                        "record_id": "nla_preferred",
+                        "title": "Preferred Fixture",
+                        "sha256": sha256,
+                        "size_bytes": payload.len(),
+                        "path": "levels/sha256/aa/fixture.rbxlx"
+                    }, {
+                        "record_id": NLA_ID,
+                        "title": "Exact Fixture",
+                        "sha256": sha256,
+                        "size_bytes": payload.len(),
+                        "path": "levels/sha256/aa/fixture.rbxlx"
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(headers_end) =
+                        request.windows(4).position(|value| value == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let request_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let (content_type, body) = if request_line.contains(" /index ") {
+                    ("application/json", index.clone())
+                } else if request_line.contains(" /levels/") {
+                    ("application/octet-stream", payload.clone())
+                } else if request_line.starts_with("POST /assets/v1/assets ") {
+                    (
+                        "application/json",
+                        br#"{"path":"operations/test-operation"}"#.to_vec(),
+                    )
+                } else if request_line.contains(" /assets/v1/operations/test-operation ") {
+                    (
+                        "application/json",
+                        br#"{"done":true,"response":{"assetId":987}}"#.to_vec(),
+                    )
+                } else {
+                    (
+                        "application/json",
+                        br#"{"moderationState":"APPROVED"}"#.to_vec(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+
+        let base = format!("http://{address}");
+        let config = Config {
+            bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            service_token: "a".repeat(32),
+            roblox_api_key: "key".into(),
+            creator_group_id: 1,
+            database_url: "sqlite::memory:?cache=shared".into(),
+            cache_ttl: std::time::Duration::from_secs(600),
+            request_timeout: std::time::Duration::from_secs(2),
+            polling_window: std::time::Duration::from_secs(1),
+            polling_interval: std::time::Duration::from_millis(1),
+            retry_count: 0,
+            roblox_base_url: base.clone(),
+            archive_index_url: format!("{base}/index"),
+            archive_blob_base_url: format!("{base}/"),
+            archive_refresh: std::time::Duration::from_secs(900),
+            archive_max_source_bytes: 1024 * 1024,
+        };
+        let pool = db::connect("sqlite::memory:?cache=shared").await.unwrap();
+        let state = AppState::new(config, pool).await.unwrap();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sandbox_game/{NLA_ID}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(32)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["source_place_id"], 192800);
+        assert_eq!(body["archive_record_id"], NLA_ID);
+        assert_eq!(body["source_kind"], "archive");
+        assert_eq!(body["status"], "approved");
     }
 }

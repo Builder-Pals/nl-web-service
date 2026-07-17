@@ -108,6 +108,49 @@ pub fn package_game(input: &[u8], game_name: &str) -> Result<Vec<u8>, AppError> 
     let input = decompress(input)?;
     let mut dom = decode(&input)?;
     let root = dom.root_ref();
+    let root_children = dom.root().children().to_vec();
+    let has_native_services = root_children.iter().any(|referent| {
+        dom.get_by_ref(*referent)
+            .is_some_and(|instance| TARGET_SERVICES.contains(&instance.class.as_str()))
+    });
+    let legacy_container = (!has_native_services)
+        .then(|| {
+            root_children.iter().copied().find(|referent| {
+                dom.get_by_ref(*referent).is_some_and(|instance| {
+                    instance.class == "Model"
+                        && instance.children().iter().any(|child| {
+                            dom.get_by_ref(*child).is_some_and(|child| {
+                                child.class == "Model"
+                                    && TARGET_SERVICES.contains(&child.name.as_str())
+                            })
+                        })
+                })
+            })
+        })
+        .flatten();
+    let source_children = legacy_container
+        .and_then(|referent| dom.get_by_ref(referent))
+        .map(|instance| instance.children().to_vec())
+        .unwrap_or(root_children);
+    let allow_legacy_services = legacy_container.is_some() || !has_native_services;
+    let services: Vec<(Ref, String)> = source_children
+        .iter()
+        .filter_map(|referent| {
+            let instance = dom.get_by_ref(*referent)?;
+            service_class(instance, allow_legacy_services)
+                .map(|class_name| (*referent, class_name.to_owned()))
+        })
+        .collect();
+    let service_refs: std::collections::HashSet<Ref> =
+        services.iter().map(|(referent, _)| *referent).collect();
+    let loose_children: Vec<Ref> = if has_native_services {
+        Vec::new()
+    } else {
+        source_children
+            .into_iter()
+            .filter(|referent| !service_refs.contains(referent))
+            .collect()
+    };
 
     let mut package_tags = Tags::new();
     package_tags.push("nl_package");
@@ -124,35 +167,69 @@ pub fn package_game(input: &[u8], game_name: &str) -> Result<Vec<u8>, AppError> 
             .with_property("Attributes", Attributes::new().with("name", game_name)),
     );
 
-    let services: Vec<Ref> = dom
-        .root()
-        .children()
-        .iter()
-        .copied()
-        .filter(|referent| {
-            dom.get_by_ref(*referent)
-                .is_some_and(|instance| TARGET_SERVICES.contains(&instance.class.as_str()))
-        })
-        .collect();
     let mut remapped_services = Vec::new();
+    let mut workspace_folder = None;
 
-    for service_ref in services {
+    for (service_ref, service_class) in services {
         remove_ignored_descendants(&mut dom, service_ref);
         let service = dom.get_by_ref(service_ref).expect("service exists");
         let service_name = service.name.to_string();
-        let service_class = service.class.to_string();
         let children = service.children().to_vec();
         let attributes = service_attributes(service);
         let folder = dom.insert(
             data_model,
             InstanceBuilder::new("Folder")
                 .with_name(service_name)
-                .with_property("Attributes", attributes.with("ClassName", service_class)),
+                .with_property(
+                    "Attributes",
+                    attributes.with("ClassName", service_class.clone()),
+                ),
         );
         for child in children {
             dom.transfer_within(child, folder);
         }
+        if service_class == "Workspace" {
+            workspace_folder = Some(folder);
+        }
         remapped_services.push((service_ref, folder));
+    }
+
+    if !loose_children.is_empty() {
+        let workspace = workspace_folder.unwrap_or_else(|| {
+            dom.insert(
+                data_model,
+                InstanceBuilder::new("Folder")
+                    .with_name("Workspace")
+                    .with_property(
+                        "Attributes",
+                        Attributes::new().with("ClassName", "Workspace"),
+                    ),
+            )
+        });
+        for child in loose_children {
+            let Some(instance) = dom.get_by_ref(child) else {
+                continue;
+            };
+            if instance.class == "Terrain"
+                || !is_archivable(instance)
+                || has_tag(instance, "nl_package")
+                || has_tag(instance, "nl_ignore")
+            {
+                dom.destroy(child);
+                continue;
+            }
+            remove_ignored_descendants(&mut dom, child);
+            dom.transfer_within(child, workspace);
+        }
+    }
+
+    if dom
+        .get_by_ref(data_model)
+        .is_none_or(|instance| instance.children().is_empty())
+    {
+        return Err(AppError::InvalidModel(
+            "game package contained no DataModel children".into(),
+        ));
     }
 
     let package_refs: Vec<Ref> = dom
@@ -204,6 +281,19 @@ pub fn package_game(input: &[u8], game_name: &str) -> Result<Vec<u8>, AppError> 
         return Err(AppError::TooLarge);
     }
     Ok(output)
+}
+
+fn service_class(instance: &rbx_dom_weak::Instance, allow_legacy: bool) -> Option<&str> {
+    if TARGET_SERVICES.contains(&instance.class.as_str()) {
+        Some(instance.class.as_str())
+    } else if allow_legacy
+        && instance.class == "Model"
+        && TARGET_SERVICES.contains(&instance.name.as_str())
+    {
+        Some(instance.name.as_str())
+    } else {
+        None
+    }
 }
 
 fn luau_parser() -> Result<Parser, AppError> {
@@ -346,12 +436,80 @@ fn decode(input: &[u8]) -> Result<WeakDom, AppError> {
     {
         let without_externals = strip_legacy_external_elements(trimmed)?;
         let normalized = strip_legacy_binary_content(without_externals.as_ref())?;
-        rbx_xml::from_reader_default(Cursor::new(normalized.as_ref()))
+        let sanitized = sanitize_legacy_xml_controls(normalized.as_ref());
+        rbx_xml::from_reader_default(Cursor::new(sanitized.as_ref()))
             .map_err(|e| AppError::InvalidModel(e.to_string()))
     } else {
         rbx_binary::from_reader(Cursor::new(input))
             .map_err(|e| AppError::InvalidModel(e.to_string()))
     }
+}
+
+fn sanitize_legacy_xml_controls(input: &[u8]) -> Cow<'_, [u8]> {
+    let mut output: Option<Vec<u8>> = None;
+    let mut copied_until = 0;
+    let mut index = 0;
+    while index < input.len() {
+        let replace_len = if input[index] < 0x20 && !matches!(input[index], b'\t' | b'\n' | b'\r') {
+            Some(1)
+        } else {
+            invalid_xml_numeric_reference(&input[index..])
+        };
+        let Some(replace_len) = replace_len else {
+            index += 1;
+            continue;
+        };
+        let output = output.get_or_insert_with(|| Vec::with_capacity(input.len()));
+        output.extend_from_slice(&input[copied_until..index]);
+        output.push(b' ');
+        index += replace_len;
+        copied_until = index;
+    }
+    let Some(mut output) = output else {
+        return Cow::Borrowed(input);
+    };
+    output.extend_from_slice(&input[copied_until..]);
+    Cow::Owned(output)
+}
+
+fn invalid_xml_numeric_reference(input: &[u8]) -> Option<usize> {
+    if !input.starts_with(b"&#") {
+        return None;
+    }
+    let mut index = 2;
+    let radix = if input
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b'x' | b'X'))
+    {
+        index += 1;
+        16_u32
+    } else {
+        10_u32
+    };
+    let digit_start = index;
+    let mut value = 0_u32;
+    while let Some(byte) = input.get(index) {
+        let digit = match radix {
+            10 => byte.is_ascii_digit().then(|| u32::from(*byte - b'0')),
+            16 => byte.to_ascii_lowercase().is_ascii_hexdigit().then(|| {
+                if byte.is_ascii_digit() {
+                    u32::from(*byte - b'0')
+                } else {
+                    u32::from(byte.to_ascii_lowercase() - b'a' + 10)
+                }
+            }),
+            _ => unreachable!(),
+        };
+        let Some(digit) = digit else {
+            break;
+        };
+        value = value.checked_mul(radix)?.checked_add(digit)?;
+        index += 1;
+    }
+    if index == digit_start || input.get(index) != Some(&b';') {
+        return None;
+    }
+    (value < 0x20 && !matches!(value, 0x09 | 0x0a | 0x0d)).then_some(index + 1)
 }
 
 fn strip_legacy_binary_content(input: &[u8]) -> Result<Cow<'_, [u8]>, AppError> {
@@ -731,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn packages_legacy_xml_with_forbidden_control_characters() {
+        let input = b"<roblox version=\"4\"><Item class=\"Workspace\" referent=\"RBX1\"><Properties><string name=\"Name\">Workspace</string></Properties><Item class=\"Script\" referent=\"RBX2\"><Properties><string name=\"Name\">Script</string><ProtectedString name=\"Source\">print('\x1b')</ProtectedString></Properties></Item></Item></roblox>";
+
+        let output = package_game(input, "Legacy Controls").unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(output)).unwrap();
+        let data_model = parsed
+            .descendants()
+            .find(|instance| instance.class == "Folder" && instance.name == "DataModel")
+            .unwrap();
+        assert!(!data_model.children().is_empty());
+        assert!(parsed
+            .descendants()
+            .any(|instance| instance.class == "Script"));
+    }
+
+    #[test]
+    fn sanitizes_raw_and_numeric_xml_control_characters() {
+        let input = b"raw:\x1b decimal:&#0; hex:&#x1B; allowed:&#9; valid:&#255;";
+        assert_eq!(
+            sanitize_legacy_xml_controls(input).as_ref(),
+            b"raw:  decimal:  hex:  allowed:&#9; valid:&#255;"
+        );
+    }
+
+    #[test]
     fn packages_game_services_scripts_attributes_and_references() {
         let lighting = InstanceBuilder::new("Lighting")
             .with_name("Lighting")
@@ -848,6 +1031,184 @@ mod tests {
         assert!(sources
             .iter()
             .all(|source| source.matches(GAME_PREFIX).count() == 1));
+    }
+
+    #[test]
+    fn packages_legacy_model_wrapped_services_and_loose_children() {
+        let source = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Model")
+                    .with_name("CreatorId=2231221 ___ PlaceId=14375697")
+                    .with_children([
+                        InstanceBuilder::new("Model")
+                            .with_name("Workspace")
+                            .with_children([
+                                InstanceBuilder::new("Part").with_name("Arena"),
+                                InstanceBuilder::new("Script")
+                                    .with_property("Source", "print('legacy')"),
+                            ]),
+                        InstanceBuilder::new("Model")
+                            .with_name("Lighting")
+                            .with_child(InstanceBuilder::new("Sky")),
+                        InstanceBuilder::new("IntValue").with_name("votesp"),
+                    ]),
+            ),
+        );
+        let mut input = Vec::new();
+        rbx_binary::to_writer(&mut input, &source, source.root().children()).unwrap();
+
+        let output = package_game(&input, "Sword Fighting Tournament").unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(output)).unwrap();
+        let data_model = parsed
+            .descendants()
+            .find(|instance| instance.class == "Folder" && instance.name == "DataModel")
+            .unwrap();
+        let children: Vec<_> = data_model
+            .children()
+            .iter()
+            .filter_map(|referent| parsed.get_by_ref(*referent))
+            .collect();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().any(|instance| instance.name == "Lighting"));
+        let workspace = children
+            .iter()
+            .find(|instance| instance.name == "Workspace")
+            .unwrap();
+        let workspace_names: Vec<_> = parsed
+            .descendants_of(workspace.referent())
+            .map(|instance| instance.name.as_str())
+            .collect();
+        assert!(workspace_names.contains(&"Arena"));
+        assert!(workspace_names.contains(&"votesp"));
+        assert!(!parsed
+            .descendants()
+            .any(|instance| instance.name.starts_with("CreatorId=")));
+    }
+
+    #[test]
+    fn rejects_empty_game_packages() {
+        let source = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let mut input = Vec::new();
+        rbx_binary::to_writer(&mut input, &source, source.root().children()).unwrap();
+
+        assert!(matches!(
+            package_game(&input, "Empty"),
+            Err(AppError::InvalidModel(message))
+                if message == "game package contained no DataModel children"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "live archive acceptance test"]
+    async fn packages_sword_fighting_tournament_archive_live() {
+        let input = reqwest::get("https://raw.githubusercontent.com/Builder-Pals/native-level-archive/main/levels/sha256/e2/e2a6ea8f0a8b747ed4d043b82ea53754af39e403e972d5f383b2d21758256342.rbxlx")
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let output = package_game(&input, "Sword Fighting Tournament").unwrap();
+        if let Ok(path) = std::env::var("NL_ACCEPTANCE_OUTPUT") {
+            std::fs::write(path, &output).unwrap();
+        }
+        let parsed = rbx_binary::from_reader(Cursor::new(output)).unwrap();
+        let data_model = parsed
+            .descendants()
+            .find(|instance| instance.class == "Folder" && instance.name == "DataModel")
+            .unwrap();
+        let children: Vec<_> = data_model
+            .children()
+            .iter()
+            .filter_map(|referent| parsed.get_by_ref(*referent))
+            .collect();
+        eprintln!(
+            "DataModel children: {}",
+            children
+                .iter()
+                .map(|instance| instance.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(!children.is_empty());
+        assert!(children.iter().any(|instance| instance.name == "Workspace"));
+        assert!(parsed
+            .descendants()
+            .any(|instance| instance.class == "Part"));
+    }
+
+    #[test]
+    #[ignore = "manual uploaded package acceptance test"]
+    fn inspects_uploaded_game_package() {
+        let path = std::env::var("NL_ACCEPTANCE_INPUT").expect("NL_ACCEPTANCE_INPUT is required");
+        let input = std::fs::read(path).unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(input)).unwrap();
+        let data_model = parsed
+            .descendants()
+            .find(|instance| instance.class == "Folder" && instance.name == "DataModel")
+            .unwrap();
+        let children: Vec<_> = data_model
+            .children()
+            .iter()
+            .filter_map(|referent| parsed.get_by_ref(*referent))
+            .collect();
+        eprintln!(
+            "uploaded DataModel children: {}",
+            children
+                .iter()
+                .map(|instance| instance.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(!children.is_empty());
+        assert!(children.iter().any(|instance| instance.name == "Workspace"));
+        assert!(parsed
+            .descendants()
+            .any(|instance| instance.class == "Part"));
+    }
+
+    #[test]
+    #[ignore = "manual local archive sweep"]
+    fn packages_all_indexed_archive_games() {
+        let root = std::path::PathBuf::from(
+            std::env::var("NL_ARCHIVE_ROOT").expect("NL_ARCHIVE_ROOT is required"),
+        );
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("place-index-v1.json")).unwrap())
+                .unwrap();
+        let places = index["places"].as_object().unwrap();
+        let mut failures = Vec::new();
+        for (place_id, place) in places {
+            let preferred = &place["preferred"];
+            let title = preferred["title"].as_str().unwrap();
+            let path = preferred["path"].as_str().unwrap();
+            let input = std::fs::read(root.join(path)).unwrap();
+            match package_game(&input, title) {
+                Ok(output) => match rbx_binary::from_reader(Cursor::new(&output)) {
+                    Ok(parsed) => {
+                        let children = parsed
+                            .descendants()
+                            .find(|instance| {
+                                instance.class == "Folder" && instance.name == "DataModel"
+                            })
+                            .map(|instance| instance.children().len())
+                            .unwrap_or_default();
+                        if children == 0 {
+                            failures.push(format!("{place_id}: empty DataModel"));
+                        } else {
+                            eprintln!(
+                                "packaged {place_id} ({title}): {children} DataModel children, {} bytes",
+                                output.len()
+                            );
+                        }
+                    }
+                    Err(error) => failures.push(format!("{place_id}: invalid output: {error}")),
+                },
+                Err(error) => failures.push(format!("{place_id}: {error}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]

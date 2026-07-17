@@ -10,7 +10,15 @@ Returns 200 OK if the service has successfully started.
 
 The purpose of sandboxing APIs is to let the web service parse Roblox binaries, and output sandboxed copies.
 
-### `GET sandbox_game/{place_id}`
+These endpoints require authentication to use:
+
+```curl
+Authorization: Bearer <SERVICE_API_TOKEN>
+OR
+x-api-key: <SERVICE_API_TOKEN>
+```
+
+### `GET /v1/sandbox_game/{place_id}`
 
 #### Uncopylocked Games
 
@@ -20,7 +28,7 @@ Games that have been left open-source are available through the proxy! Games upl
 
 Copies of games that have archived `.rbxl` files available will have the best copies available served.
 
-### `GET sandbox/{asset_id}`
+### `GET /v1/sandbox/{asset_id}`
 
 #### Assets
 

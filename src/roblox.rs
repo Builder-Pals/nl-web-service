@@ -557,6 +557,7 @@ mod tests {
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             service_token: "a".repeat(32),
             roblox_api_key: "upload-only-key".into(),
+            release_tag: "test".into(),
             creator_group_id: 1,
             database_url: "sqlite::memory:".into(),
             cache_ttl: Duration::from_secs(600),

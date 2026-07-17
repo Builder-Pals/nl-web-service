@@ -7,6 +7,13 @@ services:
       - .env
     environment:
       DATABASE_URL: sqlite:///data/cache.db
+      RELEASE_TAG: ${RELEASE_TAG:-dev}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     volumes:
       - app_data:/data
     networks:

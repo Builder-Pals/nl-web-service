@@ -246,7 +246,10 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         .fetch_one(&state.pool)
         .await
     {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status":"ok", "version": state.config.release_tag}))),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status":"ok", "version": state.config.release_tag})),
+        ),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"status":"unhealthy", "version": state.config.release_tag})),
@@ -565,6 +568,7 @@ mod tests {
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             service_token: "a".repeat(32),
             roblox_api_key: "key".into(),
+            release_tag: "test".into(),
             creator_group_id: 1,
             database_url: "sqlite::memory:?cache=shared".into(),
             cache_ttl: std::time::Duration::from_secs(600),

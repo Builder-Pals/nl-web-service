@@ -6,7 +6,7 @@ use std::{
 use crate::error::AppError;
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 use rbx_reflection::{DataType, PropertyKind, PropertySerialization, Scriptability};
-use rbx_types::{Attributes, Ref, Tags, Variant};
+use rbx_types::{Attributes, ContentId, Ref, Tags, Variant};
 use tree_sitter::{Node, Parser};
 
 pub const PREFIX: &str = "require(game:WaitForChild(\"native_legacy\"))(getfenv());";
@@ -75,23 +75,7 @@ pub fn sandbox(input: &[u8]) -> Result<Vec<u8>, AppError> {
             instance.class.as_str(),
             "Script" | "LocalScript" | "ModuleScript"
         ) {
-            let source_key = "Source".into();
-            let source = instance.properties.get(&source_key).ok_or_else(|| {
-                AppError::InvalidModel(format!("{} has no Source property", instance.class))
-            })?;
-            let text = match source {
-                Variant::String(value) => value.clone(),
-                _ => {
-                    return Err(AppError::InvalidModel(format!(
-                        "{} has an invalid Source property",
-                        instance.class
-                    )))
-                }
-            };
-            let text = transform_script_source(&mut parser, &text, PREFIX)?;
-            instance
-                .properties
-                .insert(source_key, Variant::String(text));
+            transform_script(instance, &mut parser, PREFIX)?;
         }
     }
     let roots: Vec<_> = dom.root().children().to_vec();
@@ -258,19 +242,7 @@ pub fn package_game(input: &[u8], game_name: &str) -> Result<Vec<u8>, AppError> 
             instance.class.as_str(),
             "Script" | "LocalScript" | "ModuleScript"
         ) {
-            let source = instance
-                .properties
-                .get_mut(&"Source".into())
-                .ok_or_else(|| {
-                    AppError::InvalidModel(format!("{} has no Source property", instance.class))
-                })?;
-            let Variant::String(source) = source else {
-                return Err(AppError::InvalidModel(format!(
-                    "{} has an invalid Source property",
-                    instance.class
-                )));
-            };
-            *source = transform_script_source(&mut parser, source, GAME_PREFIX)?;
+            transform_script(instance, &mut parser, GAME_PREFIX)?;
         }
     }
 
@@ -302,6 +274,70 @@ fn luau_parser() -> Result<Parser, AppError> {
         .set_language(&tree_sitter_luau::LANGUAGE.into())
         .map_err(|error| AppError::InvalidModel(format!("failed to load Luau parser: {error}")))?;
     Ok(parser)
+}
+
+fn transform_script(
+    instance: &mut rbx_dom_weak::Instance,
+    parser: &mut Parser,
+    prefix: &str,
+) -> Result<(), AppError> {
+    let source_key = "Source".into();
+    let source = match instance.properties.get(&source_key) {
+        Some(Variant::String(source)) => source,
+        Some(_) => {
+            return Err(AppError::InvalidModel(format!(
+                "{} has an invalid Source property",
+                instance.class
+            )))
+        }
+        None => {
+            return Err(AppError::InvalidModel(format!(
+                "{} has no Source property",
+                instance.class
+            )))
+        }
+    };
+    let source = transform_script_source(parser, source, prefix)?;
+    instance
+        .properties
+        .insert(source_key, Variant::String(source));
+
+    let linked_source_key = "LinkedSource".into();
+    let linked_source = match instance.properties.get(&linked_source_key) {
+        Some(Variant::ContentId(linked_source)) if !linked_source.as_str().is_empty() => {
+            Some(linked_source.as_str().to_owned())
+        }
+        Some(Variant::ContentId(_)) | None => None,
+        Some(_) => {
+            return Err(AppError::InvalidModel(format!(
+                "{} has an invalid LinkedSource property",
+                instance.class
+            )))
+        }
+    };
+    let Some(linked_source) = linked_source else {
+        return Ok(());
+    };
+
+    instance
+        .properties
+        .insert(linked_source_key, Variant::ContentId(ContentId::new()));
+    let attributes_key = "Attributes".into();
+    let mut attributes = match instance.properties.get(&attributes_key) {
+        Some(Variant::Attributes(attributes)) => attributes.clone(),
+        Some(_) => {
+            return Err(AppError::InvalidModel(format!(
+                "{} has invalid Attributes",
+                instance.class
+            )))
+        }
+        None => Attributes::new(),
+    };
+    attributes.insert("LinkedSource".into(), Variant::String(linked_source));
+    instance
+        .properties
+        .insert(attributes_key, Variant::Attributes(attributes));
+    Ok(())
 }
 
 fn transform_script_source(
@@ -825,6 +861,54 @@ mod tests {
     }
 
     #[test]
+    fn preserves_and_clears_linked_sources_for_all_script_types() {
+        let script_classes = ["Script", "LocalScript", "ModuleScript"];
+        let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_children(
+            script_classes.iter().enumerate().map(|(index, class)| {
+                let mut attributes = Attributes::new();
+                attributes.insert("Existing".into(), Variant::Bool(true));
+                InstanceBuilder::new(*class)
+                    .with_name(format!("Linked{index}"))
+                    .with_property("Source", format!("print('{index}')"))
+                    .with_property(
+                        "LinkedSource",
+                        ContentId::from(format!("rbxassetid://{}", index + 100)),
+                    )
+                    .with_property("Attributes", attributes)
+            }),
+        ));
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+
+        let transformed = sandbox(&bytes).unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(transformed)).unwrap();
+        for (index, class) in script_classes.iter().enumerate() {
+            let script = parsed
+                .descendants()
+                .find(|instance| instance.name == format!("Linked{index}"))
+                .unwrap();
+            assert_eq!(&script.class, class);
+            assert_eq!(
+                script.properties.get(&"LinkedSource".into()),
+                Some(&Variant::ContentId(ContentId::new()))
+            );
+            let Some(Variant::Attributes(attributes)) = script.properties.get(&"Attributes".into())
+            else {
+                panic!("attributes missing")
+            };
+            assert_eq!(attributes.get("Existing"), Some(&Variant::Bool(true)));
+            assert_eq!(
+                attribute_text(attributes.get("LinkedSource")),
+                Some(format!("rbxassetid://{}", index + 100))
+            );
+            let Some(Variant::String(source)) = script.properties.get(&"Source".into()) else {
+                panic!("source missing")
+            };
+            assert_eq!(source, &format!("{PREFIX}print(__STRDEC '{index}')"));
+        }
+    }
+
+    #[test]
     fn accepts_xml_and_outputs_binary() {
         let input = br#"<roblox version="4"><Item class="Script" referent="RBX1"><Properties><string name="Name">Script</string><ProtectedString name="Source">print('xml')</ProtectedString></Properties></Item></roblox>"#;
         let transformed = sandbox(input).unwrap();
@@ -940,7 +1024,9 @@ mod tests {
         let scripts = InstanceBuilder::new("ServerScriptService")
             .with_name("ServerScriptService")
             .with_children([
-                InstanceBuilder::new("Script").with_property("Source", "print('wrapped')"),
+                InstanceBuilder::new("Script")
+                    .with_property("Source", "print('wrapped')")
+                    .with_property("LinkedSource", ContentId::from("rbxassetid://12345")),
                 InstanceBuilder::new("ModuleScript")
                     .with_property("Source", format!("{GAME_PREFIX}return true")),
             ]);
@@ -1031,6 +1117,21 @@ mod tests {
         assert!(sources
             .iter()
             .all(|source| source.matches(GAME_PREFIX).count() == 1));
+        let linked_script = parsed
+            .descendants()
+            .find(|instance| {
+                matches!(
+                    instance.properties.get(&"LinkedSource".into()),
+                    Some(Variant::ContentId(linked_source)) if linked_source.as_str().is_empty()
+                ) && matches!(
+                    instance.properties.get(&"Attributes".into()),
+                    Some(Variant::Attributes(attributes))
+                        if attribute_text(attributes.get("LinkedSource"))
+                            == Some("rbxassetid://12345".into())
+                )
+            })
+            .expect("linked script was preserved as an attribute");
+        assert_eq!(linked_script.class, "Script");
     }
 
     #[test]
@@ -1166,6 +1267,76 @@ mod tests {
         assert!(parsed
             .descendants()
             .any(|instance| instance.class == "Part"));
+    }
+
+    #[test]
+    #[ignore = "manual LinkedSource game acceptance test"]
+    fn packages_linked_source_game_input() {
+        let path = std::env::var("NL_ACCEPTANCE_INPUT").expect("NL_ACCEPTANCE_INPUT is required");
+        let input = std::fs::read(path).unwrap();
+        let source = decode(&input).unwrap();
+        let original_linked_sources: std::collections::HashSet<_> = source
+            .descendants()
+            .filter(|instance| {
+                matches!(
+                    instance.class.as_str(),
+                    "Script" | "LocalScript" | "ModuleScript"
+                )
+            })
+            .filter_map(
+                |instance| match instance.properties.get(&"LinkedSource".into()) {
+                    Some(Variant::ContentId(linked_source))
+                        if !linked_source.as_str().is_empty() =>
+                    {
+                        Some(linked_source.as_str().to_owned())
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        assert!(
+            !original_linked_sources.is_empty(),
+            "input contained no linked scripts"
+        );
+
+        let output = package_game(&input, "LinkedSource acceptance fixture").unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(output)).unwrap();
+        let linked_scripts: Vec<_> = parsed
+            .descendants()
+            .filter(|instance| {
+                matches!(
+                    instance.class.as_str(),
+                    "Script" | "LocalScript" | "ModuleScript"
+                )
+            })
+            .filter_map(|instance| {
+                let Some(Variant::ContentId(linked_source)) =
+                    instance.properties.get(&"LinkedSource".into())
+                else {
+                    return None;
+                };
+                assert!(linked_source.as_str().is_empty());
+                let Some(Variant::String(source)) = instance.properties.get(&"Source".into())
+                else {
+                    panic!("linked script source missing")
+                };
+                assert!(source.starts_with(GAME_PREFIX));
+                let Some(Variant::Attributes(attributes)) =
+                    instance.properties.get(&"Attributes".into())
+                else {
+                    return None;
+                };
+                attribute_text(attributes.get("LinkedSource"))
+                    .map(|linked_source| (instance, linked_source))
+            })
+            .collect();
+        assert!(
+            !linked_scripts.is_empty(),
+            "output contained no linked scripts"
+        );
+        assert!(linked_scripts.iter().all(|(_, linked_source)| {
+            original_linked_sources.contains(linked_source.as_str())
+        }));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::{
     db,
     error::AppError,
     model::{GameSandboxResponse, GameWorkflow, SandboxResponse, Workflow},
-    roblox::{Moderation, Operation, RobloxClient},
+    roblox::{GameCreator, Moderation, Operation, RobloxClient},
     transform,
 };
 
@@ -102,15 +102,20 @@ async fn run_game(
                 .as_ref()
                 .is_none_or(|variant| row.source_revision == format!("archive:{}", variant.sha256))
         {
-            return game_response(&row, true);
+            let creator = best_effort_creator(state, id).await;
+            return game_response(&row, true, creator);
         }
     }
 
-    let (revision, name) = if let Some(variant) = &archive {
-        (format!("archive:{}", variant.sha256), variant.title.clone())
+    let (revision, name, creator) = if let Some(variant) = &archive {
+        (
+            format!("archive:{}", variant.sha256),
+            variant.title.clone(),
+            best_effort_creator(state, id).await,
+        )
     } else {
         let metadata = state.roblox.validate_game(id).await?;
-        (metadata.revision, metadata.name)
+        (metadata.revision, metadata.name, metadata.creator)
     };
     let current = db::get_game(&state.pool, id).await?;
     match current {
@@ -119,7 +124,7 @@ async fn run_game(
             if row.state == "approved" {
                 let mut fresh = row.clone();
                 fresh.validated_at = now;
-                return game_response(&fresh, true);
+                return game_response(&fresh, true, creator);
             }
             if row.state == "failed" {
                 return Err(AppError::Upstream(
@@ -182,7 +187,7 @@ async fn run_game(
                     )));
                 }
             },
-            "approved" => return game_response(&row, false),
+            "approved" => return game_response(&row, false, creator),
             "failed" => {
                 return Err(AppError::Upstream(
                     row.failure_message
@@ -195,7 +200,7 @@ async fn run_game(
             let row = db::get_game(&state.pool, id)
                 .await?
                 .expect("game workflow exists");
-            return game_response(&row, false);
+            return game_response(&row, false, creator);
         }
         sleep(state.config.polling_interval).await;
     }
@@ -204,6 +209,7 @@ async fn run_game(
 fn game_response(
     row: &GameWorkflow,
     cached: bool,
+    creator: Option<GameCreator>,
 ) -> Result<(StatusCode, HeaderMap, Json<GameSandboxResponse>), AppError> {
     let complete = row.state == "approved";
     let mut headers = HeaderMap::new();
@@ -219,6 +225,8 @@ fn game_response(
         headers,
         Json(GameSandboxResponse {
             source_place_id: row.source_place_id as u64,
+            creator_id: creator.map(|creator| creator.id),
+            creator_type: creator.map(|creator| creator.creator_type),
             sandboxed_asset_id: row.sandboxed_asset_id.map(|id| id as u64),
             status: row.state.clone(),
             cached,
@@ -228,6 +236,16 @@ fn game_response(
             retry_after_seconds: (!complete).then_some(10),
         }),
     ))
+}
+
+async fn best_effort_creator(state: &AppState, place_id: u64) -> Option<GameCreator> {
+    match state.roblox.game_creator(place_id).await {
+        Ok(creator) => creator,
+        Err(error) => {
+            tracing::warn!(place_id, %error, "could not retrieve source place creator");
+            None
+        }
+    }
 }
 
 fn archive_variant(row: &GameWorkflow) -> Result<ArchiveVariant, AppError> {
@@ -500,7 +518,7 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            for _ in 0..5 {
+            for _ in 0..7 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 loop {
@@ -536,6 +554,13 @@ mod tests {
                     .to_owned();
                 let (content_type, body) = if request_line.contains(" /index ") {
                     ("application/json", index.clone())
+                } else if request_line.contains("/universes/v1/places/192800/universe") {
+                    ("application/json", br#"{"universeId":47545}"#.to_vec())
+                } else if request_line.contains("/v1/games?universeIds=47545") {
+                    (
+                        "application/json",
+                        br#"{"data":[{"creator":{"id":2468,"type":"Group"}}]}"#.to_vec(),
+                    )
                 } else if request_line.contains(" /levels/") {
                     ("application/octet-stream", payload.clone())
                 } else if request_line.starts_with("POST /assets/v1/assets ") {
@@ -599,6 +624,8 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(body["source_place_id"], 192800);
+        assert_eq!(body["creator_id"], 2468);
+        assert_eq!(body["creator_type"], "Group");
         assert_eq!(body["archive_record_id"], NLA_ID);
         assert_eq!(body["source_kind"], "archive");
         assert_eq!(body["status"], "approved");

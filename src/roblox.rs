@@ -8,7 +8,7 @@ use reqwest::{header::HeaderMap, multipart, Client, Response, StatusCode, Url};
 use serde_json::{json, Value};
 use tokio::time::sleep;
 
-use crate::{config::Config, error::AppError};
+use crate::{config::Config, error::AppError, model::CreatorType};
 
 const LIMIT: usize = 20 * 1024 * 1024;
 
@@ -28,6 +28,13 @@ pub struct SourceMetadata {
 pub struct GameMetadata {
     pub revision: String,
     pub name: String,
+    pub creator: Option<GameCreator>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GameCreator {
+    pub id: u64,
+    pub creator_type: CreatorType,
 }
 
 #[derive(Debug)]
@@ -115,6 +122,17 @@ impl RobloxClient {
             Err(AppError::NotFound) => self.validate_unlisted_game(place_id).await,
             result => result,
         }
+    }
+
+    pub async fn game_creator(&self, place_id: u64) -> Result<Option<GameCreator>, AppError> {
+        let universe_response = self.send(|| self.game_universe_request(place_id)).await?;
+        let universe = checked_json(universe_response).await?;
+        let Some(universe_id) = find_u64(&universe, &["universeId", "universe_id"]) else {
+            return Ok(None);
+        };
+        let details_response = self.send(|| self.game_details_request(universe_id)).await?;
+        let details = checked_json(details_response).await?;
+        Ok(game_creator(&details))
     }
 
     async fn validate_unlisted_game(&self, place_id: u64) -> Result<GameMetadata, AppError> {
@@ -407,7 +425,29 @@ fn game_metadata(value: &Value, place_id: u64) -> Result<GameMetadata, AppError>
     let revision = find_string(game, &["updated"])
         .or_else(|| find_u64(game, &["id"]).map(|id| id.to_string()))
         .unwrap_or_else(|| place_id.to_string());
-    Ok(GameMetadata { revision, name })
+    Ok(GameMetadata {
+        revision,
+        name,
+        creator: game_creator(value),
+    })
+}
+
+fn game_creator(value: &Value) -> Option<GameCreator> {
+    let game = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())?;
+    let creator = find_value(game, &["creator"])?;
+    let id = find_u64(creator, &["id", "creatorId", "creator_id"])?;
+    let creator_type = find_string(creator, &["type", "creatorType", "creator_type"])?;
+    let creator_type = if creator_type.eq_ignore_ascii_case("user") {
+        CreatorType::User
+    } else if creator_type.eq_ignore_ascii_case("group") {
+        CreatorType::Group
+    } else {
+        return None;
+    };
+    Some(GameCreator { id, creator_type })
 }
 
 fn metadata_unavailable(status: StatusCode) -> bool {
@@ -443,6 +483,7 @@ fn unlisted_game_metadata(
     Ok(GameMetadata {
         revision,
         name: format!("Unlisted Game {place_id}"),
+        creator: None,
     })
 }
 
@@ -658,6 +699,22 @@ mod tests {
         let metadata = game_metadata(&value, 1818).unwrap();
         assert_eq!(metadata.name, "Classic: Crossroads");
         assert_eq!(metadata.revision, "2024-01-29T22:05:10.417Z");
+        assert_eq!(
+            metadata.creator,
+            Some(GameCreator {
+                id: 999,
+                creator_type: CreatorType::User,
+            })
+        );
+    }
+
+    #[test]
+    fn omits_creator_with_an_unknown_type() {
+        let value = json!({"data":[{
+            "creator": {"id": 999, "type": "Unknown"}
+        }]});
+
+        assert_eq!(game_creator(&value), None);
     }
 
     #[test]

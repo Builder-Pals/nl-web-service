@@ -1,6 +1,12 @@
 use serde::Serialize;
 use sqlx::FromRow;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum CreatorType {
+    User,
+    Group,
+}
+
 #[derive(Clone, Debug, FromRow)]
 pub struct Workflow {
     pub source_asset_id: i64,
@@ -43,6 +49,10 @@ pub struct GameWorkflow {
 #[derive(Debug, Serialize)]
 pub struct GameSandboxResponse {
     pub source_place_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator_type: Option<CreatorType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandboxed_asset_id: Option<u64>,
     pub status: String,

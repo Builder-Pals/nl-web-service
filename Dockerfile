@@ -1,5 +1,6 @@
 FROM rust:1.88-bookworm AS builder
 WORKDIR /app
+ENV CARGO_BUILD_JOBS=1
 COPY . .
 RUN cargo build --locked --release
 

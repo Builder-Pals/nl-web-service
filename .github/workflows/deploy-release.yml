@@ -70,8 +70,8 @@ jobs:
 
           export RELEASE_TAG
           docker compose config --quiet
-          docker compose run --rm --no-deps caddy \
-            caddy validate --config /etc/caddy/Caddyfile
+          docker compose run --rm --no-deps -T caddy \
+            caddy validate --config /etc/caddy/Caddyfile </dev/null
           docker compose build --pull app
           docker compose up -d --remove-orphans --wait --wait-timeout 60
           docker compose exec -T caddy \

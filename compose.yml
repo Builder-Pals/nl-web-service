@@ -17,7 +17,9 @@ services:
     volumes:
       - app_data:/data
     networks:
-      - internal
+      internal:
+        aliases:
+          - native-web-service
 
   caddy:
     image: caddy:2-alpine

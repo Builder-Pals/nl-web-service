@@ -1,4 +1,9 @@
 {$DOMAIN} {
-    encode zstd gzip
-    reverse_proxy app:8080
+	encode zstd gzip
+	reverse_proxy app:8080
+}
+
+{$ARCHIVE_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy native-archive:8080
 }

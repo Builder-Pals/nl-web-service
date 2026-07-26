@@ -26,6 +26,7 @@ services:
       - app
     environment:
       DOMAIN: ${DOMAIN:?DOMAIN must be set}
+      ARCHIVE_DOMAIN: ${ARCHIVE_DOMAIN:-archive.fizzyhex.design}
     ports:
       - "80:80"
       - "443:443"
@@ -36,9 +37,13 @@ services:
       - caddy_config:/config
     networks:
       - internal
+      - edge
 
 networks:
   internal:
+  edge:
+    name: native-edge
+    external: true
 
 volumes:
   app_data:

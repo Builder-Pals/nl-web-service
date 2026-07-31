@@ -736,7 +736,7 @@ fn attribute_value(
             };
             let item = database
                 .enums
-                .get(enum_name.as_ref())?
+                .get(*enum_name)?
                 .items
                 .iter()
                 .find(|(_, candidate)| **candidate == value.to_u32())?
@@ -1400,6 +1400,32 @@ mod tests {
             instance.class == "Configuration"
                 && instance.name == "Game Package (Classic: Crossroads)"
         }));
+        assert!(parsed
+            .descendants()
+            .any(|instance| instance.class == "Folder" && instance.name == "Workspace"));
+    }
+
+    // this is for 'zombies are attacking bikini bottom'
+    #[tokio::test]
+    #[ignore = "live archive acceptance test"]
+    async fn parses_place_31500456_shared_string_tags_archive() {
+        let client = reqwest::Client::builder().build().unwrap();
+        let input = client
+            .get(concat!(
+                "https://raw.githubusercontent.com/Builder-Pals/native-level-archive/main/",
+                "levels/sha256/38/",
+                "384c8c5d9005ff8a1b53ebb60ee0c51aee31c9301bfabc48ce67abba6a9f132d.rbxl"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let output = package_game(&input, "Terror in Bikini Bottom").unwrap();
+        let parsed = rbx_binary::from_reader(Cursor::new(output)).unwrap();
         assert!(parsed
             .descendants()
             .any(|instance| instance.class == "Folder" && instance.name == "Workspace"));

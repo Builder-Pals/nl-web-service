@@ -392,32 +392,11 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.4.6",
- "windows-sys 0.48.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -428,7 +407,7 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.2",
+ "redox_users",
  "windows-sys 0.61.2",
 ]
 
@@ -1089,9 +1068,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.6"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 dependencies = [
  "twox-hash",
 ]
@@ -1178,8 +1157,8 @@ dependencies = [
  "rand 0.9.5",
  "rbx_binary",
  "rbx_dom_weak",
- "rbx_reflection 6.1.0",
- "rbx_reflection_database 2.0.2+roblox-700",
+ "rbx_reflection",
+ "rbx_reflection_database",
  "rbx_types",
  "rbx_xml",
  "reqwest",
@@ -1557,17 +1536,17 @@ dependencies = [
 
 [[package]]
 name = "rbx_binary"
-version = "2.0.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95e2b4a187679aa3d169ed50ed5eedbf26383459fec83bf1232c2934b35b24de"
+checksum = "d0a6f15a595fab79d15d50799335543ac5b97618c31ad3d0c93e2713a8bf8d34"
 dependencies = [
  "ahash",
  "log",
  "lz4_flex",
  "profiling",
  "rbx_dom_weak",
- "rbx_reflection 6.1.0",
- "rbx_reflection_database 2.0.2+roblox-700",
+ "rbx_reflection",
+ "rbx_reflection_database",
  "thiserror 1.0.69",
  "zstd",
 ]
@@ -1586,17 +1565,6 @@ dependencies = [
 
 [[package]]
 name = "rbx_reflection"
-version = "6.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84f635e79d5d710c82e9049faa57d32945e76a6b041280dc6274f732c0dd78dc"
-dependencies = [
- "rbx_types",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "rbx_reflection"
 version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f53e5c4cf136060f7c514bd4d6f02436a57e36754c544965a7840123bc662d7"
@@ -1608,26 +1576,13 @@ dependencies = [
 
 [[package]]
 name = "rbx_reflection_database"
-version = "2.0.2+roblox-700"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de2753b896d08d74316d8b89fbeb2470ebd3986404ebba82fa85fcc0330955cf"
-dependencies = [
- "dirs 5.0.1",
- "log",
- "rbx_reflection 6.1.0",
- "rmp-serde",
- "serde",
-]
-
-[[package]]
-name = "rbx_reflection_database"
 version = "3.0.0+roblox-728"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f5dd357c4c95d43e12283b9065b8b7b41788219db7a0f3a77a6e111f51522e6"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
  "log",
- "rbx_reflection 7.0.0",
+ "rbx_reflection",
  "rmp-serde",
  "serde",
 ]
@@ -1657,8 +1612,8 @@ dependencies = [
  "base64 0.13.1",
  "log",
  "rbx_dom_weak",
- "rbx_reflection 7.0.0",
- "rbx_reflection_database 3.0.0+roblox-728",
+ "rbx_reflection",
+ "rbx_reflection_database",
  "xml-rs",
 ]
 
@@ -1678,17 +1633,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5102a6aaa05aa011a238e178e6bca86d2cb56fc9f586d37cb80f5bca6e07759"
 dependencies = [
  "bitflags 2.13.0",
-]
-
-[[package]]
-name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
 ]
 
 [[package]]

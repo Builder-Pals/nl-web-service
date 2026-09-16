@@ -1,5 +1,15 @@
 # nl-web-service
 
+## Production deployment
+
+This repository deploys the application only. The application listens on
+`0.0.0.0:8080` and joins the external Docker network `web` as
+`native-web-service`.
+
+TLS termination and public ports `80` and `443` are owned by the separate
+private `/opt/caddy` infrastructure project. Do not start a Caddy service from
+this repository.
+
 This project is responsible for providing web services for Native Legacy.
 
 ## `GET /healthz`

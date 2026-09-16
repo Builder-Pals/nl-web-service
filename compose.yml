@@ -20,27 +20,9 @@ services:
       internal:
         aliases:
           - native-web-service
-
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    depends_on:
-      - app
-    environment:
-      DOMAIN: ${DOMAIN:?DOMAIN must be set}
-      ARCHIVE_DOMAIN: ${ARCHIVE_DOMAIN:-archive.fizzyhex.design}
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - /opt/caddy/sites:/etc/caddy/sites:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - internal
-      - edge
+      edge:
+        aliases:
+          - native-web-service
 
 networks:
   internal:
@@ -50,5 +32,3 @@ networks:
 
 volumes:
   app_data:
-  caddy_data:
-  caddy_config:
